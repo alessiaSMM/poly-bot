@@ -1,4 +1,4 @@
-google-cloud-kms==2.25.0
+google-cloud-kms==3.7.0
 google-api-core>=2.18.0
 web3==6.20.1
 eth-account==0.11.3
@@ -6,3 +6,4 @@ eth-keys==0.5.1
 eth-abi==5.1.0
 python-dotenv==1.0.1
 cryptography==43.0.1
+
