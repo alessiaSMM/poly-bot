@@ -1,0 +1,1 @@
+"""Placeholder per il Listener A.1 (Analisi & Filtri) che collegheremo nello Step 2."""
