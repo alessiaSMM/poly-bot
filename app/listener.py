@@ -2,17 +2,17 @@ import asyncio
 import json
 import websockets
 
-POLY_WS_URL = "wss://api.polymarket.com/markets/ws"
+POLY_WS_URL = "wss://prod-events.polymarket.com/events"
 
 async def polymarket_listener(callback):
     """
-    Listener A.1 - ascolta il feed WebSocket dei mercati Polymarket.
+    Listener A.1 - ascolta il feed WebSocket ufficiale di Polymarket.
     """
     try:
         async with websockets.connect(POLY_WS_URL, ping_interval=20) as ws:
-            print("Connesso al feed ufficiale Polymarket WebSocket")
+            print("Connesso al feed Polymarket (prod-events)")
 
-            # Sottoscrizione base (Polymarket invia tutti i market updates)
+            # Messaggio di subscription richiesto dall'endpoint events
             subscribe_msg = {
                 "type": "subscribe",
                 "channels": ["markets"]
@@ -23,8 +23,7 @@ async def polymarket_listener(callback):
                 msg = await ws.recv()
                 data = json.loads(msg)
 
-                if "type" in data:
-                    await callback(data)
+                await callback(data)
 
     except Exception as e:
         print("Errore WebSocket:", e)
