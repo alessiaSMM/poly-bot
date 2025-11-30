@@ -6,14 +6,13 @@ POLY_WS_URL = "wss://strapi-mtcg.polymarket.com/updates"
 
 async def polymarket_listener(callback):
     """
-    Listener A.1 — ascolta il feed WebSocket di Polymarket.
-    Chiama 'callback' a ogni update del mercato.
+    Listener A.1 - ascolta il feed WebSocket di Polymarket.
+    Chiama 'callback' quando arriva un aggiornamento.
     """
     try:
         async with websockets.connect(POLY_WS_URL, ping_interval=20) as ws:
             print("Connesso al feed Polymarket WebSocket")
 
-            # Sottoscrizione agli aggiornamenti dei mercati
             subscribe_msg = {
                 "type": "subscribe",
                 "channels": ["markets"]
@@ -24,7 +23,6 @@ async def polymarket_listener(callback):
                 msg = await ws.recv()
                 data = json.loads(msg)
 
-                # Filtra solo gli eventi utili
                 if "type" in data and data["type"] == "market_update":
                     await callback(data)
 
@@ -34,7 +32,6 @@ async def polymarket_listener(callback):
         return await polymarket_listener(callback)
 
 
-# Test locale (non usato in produzione)
 async def test():
     async def on_update(event):
         print("Update mercato:", str(event)[:200])
