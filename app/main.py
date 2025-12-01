@@ -1,35 +1,27 @@
 import asyncio
+import threading
 from .listener import polymarket_listener
-from .kms_signer import (
-    KMSSigner, build_kms_client_from_json, kms_key_resource
-)
-from .config import GCP_SA_JSON
-import os
+from .config import *
+from .kms_signer import build_kms_client_from_json, kms_key_resource, KMSSigner
+from .server import app
 
-async def handle_market_update(event):
-    """
-    Qui entra il punto A.1 (Analisi & Filtri).
-    Questo è il punto dove TU decidi cosa è utile.
-    """
-    market_id = event.get("market_id")
-    prob = event.get("prob")
+async def on_market_event(event):
+    print("EVENTO:", str(event)[:200])
 
-    print(f"💡 Update mercato {market_id}: prob={prob}")
-
-
-async def main_async():
-    sa_json = os.getenv("GCP_SA_JSON")
+async def bot_loop():
+    sa_json = GCP_SA_JSON
     kms_client = build_kms_client_from_json(sa_json)
     signer = KMSSigner(kms_client, kms_key_resource())
-
     print("Indirizzo KMS:", signer.get_eth_address())
+    await polymarket_listener(on_market_event)
 
-    await polymarket_listener(handle_market_update)
-
+def start_flask():
+    app.run(host="0.0.0.0", port=10000)
 
 def main():
-    asyncio.run(main_async())
-
+    t = threading.Thread(target=start_flask, daemon=True)
+    t.start()
+    asyncio.run(bot_loop())
 
 if __name__ == "__main__":
     main()
