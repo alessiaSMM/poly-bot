@@ -14,7 +14,7 @@ SUBSCRIPTION = {
 async def start_rtds_listener(callback=None):
     """
     Listener RTDS ufficiale Polymarket.
-    Se callback è definita, ogni messaggio viene passato a quella funzione.
+    Gestisce automaticamente messaggi non-JSON e riconnessioni.
     """
     while True:
         try:
@@ -31,18 +31,18 @@ async def start_rtds_listener(callback=None):
                 while True:
                     msg = await ws.recv()
 
-# Ignora messaggi non JSON (es. "CONNECTED", "PING", "PONG")
-if not msg.startswith("{"):
-    # print(f"Ignorato messaggio non JSON: {msg}")
-    continue
+                    # Ignora messaggi non JSON (es. "CONNECTED", "PING", "PONG")
+                    if not msg.startswith("{"):
+                        # Debug opzionale:
+                        # print("Ignorato:", msg)
+                        continue
 
-try:
-    data = json.loads(msg)
-except Exception as e:
-    print("⚠️ Errore json.loads:", e)
-    print("Messaggio ricevuto:", msg)
-    continue
-
+                    try:
+                        data = json.loads(msg)
+                    except Exception as e:
+                        print("⚠️ json.loads errore:", e)
+                        print("Messaggio ricevuto:", msg)
+                        continue
 
                     if data.get("topic") == "crypto_prices":
                         if callback:
@@ -54,4 +54,3 @@ except Exception as e:
             print("❌ RTDS errore:", e)
             print("🔄 Riconnessione tra 3s...")
             await asyncio.sleep(3)
-
