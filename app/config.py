@@ -1,13 +1,20 @@
 import os
+from dotenv import load_dotenv
 
-GCP_PROJECT_ID   = os.getenv("GCP_PROJECT_ID", "")
-KMS_LOCATION     = os.getenv("KMS_LOCATION", "global")
-KMS_KEY_RING     = os.getenv("KMS_KEY_RING", "")
-KMS_KEY_NAME     = os.getenv("KMS_KEY_NAME", "")
-KMS_KEY_VERSION  = os.getenv("KMS_KEY_VERSION", "1")
+# ROOT del progetto = cartella sopra /app
+ROOT_DIR = os.path.dirname(os.path.dirname(__file__))
 
-RPC_URL          = os.getenv("RPC_URL", "")
-CHAIN_ID         = int(os.getenv("CHAIN_ID", "137"))
+# path file .env
+ENV_PATH = os.path.join(ROOT_DIR, ".env")
 
-# variabile che contiene il JSON del servizio di Google Cloud Platform
-GCP_SA_JSON      = os.getenv("GCP_SA_JSON", "")
+# carica variabili
+load_dotenv(ENV_PATH)
+
+GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+
+PROJECT_ID = os.getenv("PROJECT_ID")
+LOCATION_ID = os.getenv("LOCATION_ID")
+KEYRING_ID = os.getenv("KEYRING_ID")
+KEY_ID = os.getenv("KEY_ID")
+KEY_VERSION = os.getenv("KEY_VERSION")
+RPC_URL = os.getenv("RPC_URL")
