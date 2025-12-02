@@ -4,45 +4,41 @@ import websockets
 
 RTDS_URL = "wss://ws-live-data.polymarket.com"
 
-# messaggio di subscribe preso dalla doc ufficiale RTDS Crypto Prices (Binance source)
-SUBSCRIBE_MSG = {
+SUBSCRIPTION = {
     "action": "subscribe",
     "subscriptions": [
-        {
-            "topic": "crypto_prices",
-            "type": "update",
-            # "filters": "btcusdt,ethusdt"  # opzionale, se vuoi filtrare
-        }
+        {"topic": "crypto_prices", "type": "update"}
     ]
 }
 
-async def polymarket_listener(callback):
+async def start_rtds_listener(callback=None):
+    """
+    Listener RTDS ufficiale Polymarket.
+    Se callback è definita, ogni messaggio viene passato a quella funzione.
+    """
     while True:
         try:
-            print(f"Mi collego a {RTDS_URL} ...")
-            async with websockets.connect(RTDS_URL, ping_interval=10) as ws:
-                print("✅ Connesso a RTDS (crypto_prices)")
+            print("🔵 Connessione a RTDS...")
+            async with websockets.connect(
+                RTDS_URL,
+                ping_interval=20,
+                ping_timeout=20,
+            ) as ws:
 
-                # invio subscribe come da documentazione
-                await ws.send(json.dumps(SUBSCRIBE_MSG))
-                print("📨 Subscribe inviato a RTDS")
+                await ws.send(json.dumps(SUBSCRIPTION))
+                print("🟢 Sottoscritto a crypto_prices")
 
-                # ricevo messaggi in loop
                 while True:
-                    raw = await ws.recv()
-                    try:
-                        data = json.loads(raw)
-                    except json.JSONDecodeError:
-                        print("Messaggio non JSON:", raw)
-                        continue
+                    msg = await ws.recv()
+                    data = json.loads(msg)
 
-                    # log minimale
-                    print("EVENTO:", data.get("topic"), data.get("type"), data.get("payload"))
-
-                    # callback utente (per il modulo analisi & filtri)
-                    await callback(data)
+                    if data.get("topic") == "crypto_prices":
+                        if callback:
+                            callback(data)
+                        else:
+                            print(data)
 
         except Exception as e:
-            print("Errore WebSocket RTDS:", e)
-            print("Riprovo tra 5 secondi...")
-            await asyncio.sleep(5)
+            print("❌ RTDS errore:", e)
+            print("🔄 Riconnessione tra 3s...")
+            await asyncio.sleep(3)
