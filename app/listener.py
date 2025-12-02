@@ -30,7 +30,19 @@ async def start_rtds_listener(callback=None):
 
                 while True:
                     msg = await ws.recv()
-                    data = json.loads(msg)
+
+# Ignora messaggi non JSON (es. "CONNECTED", "PING", "PONG")
+if not msg.startswith("{"):
+    # print(f"Ignorato messaggio non JSON: {msg}")
+    continue
+
+try:
+    data = json.loads(msg)
+except Exception as e:
+    print("⚠️ Errore json.loads:", e)
+    print("Messaggio ricevuto:", msg)
+    continue
+
 
                     if data.get("topic") == "crypto_prices":
                         if callback:
@@ -42,3 +54,4 @@ async def start_rtds_listener(callback=None):
             print("❌ RTDS errore:", e)
             print("🔄 Riconnessione tra 3s...")
             await asyncio.sleep(3)
+
