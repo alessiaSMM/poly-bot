@@ -1,26 +1,20 @@
 import asyncio
-import threading
-from .listener import polymarket_listener
-from .config import *
-from .kms_signer import build_kms_client_from_json, kms_key_resource, KMSSigner
-from .server import app
-
-async def on_market_event(event):
-    print("EVENTO:", str(event)[:200])
+from app.listener import start_rtds_listener
+from app.copy_trader import process_leader_trades
 
 async def bot_loop():
-    sa_json = GCP_SA_JSON
-    kms_client = build_kms_client_from_json(sa_json)
-    signer = KMSSigner(kms_client, kms_key_resource())
-    print("Indirizzo KMS:", signer.get_eth_address())
-    await polymarket_listener(on_market_event)
+    print("🔥 Polybot avviato (modalità PAPER - nessun trade reale)")
+    print("📊 RTDS + Copy-trader attivi")
 
-def start_flask():
-    app.run(host="0.0.0.0", port=10000)
+    # RTDS (puoi anche toglierlo se ti dà fastidio)
+   # rtds_task = asyncio.create_task(start_rtds_listener())
+
+    # Copy-trader loop
+    while True:
+        process_leader_trades()
+        await asyncio.sleep(5)
 
 def main():
-    t = threading.Thread(target=start_flask, daemon=True)
-    t.start()
     asyncio.run(bot_loop())
 
 if __name__ == "__main__":
