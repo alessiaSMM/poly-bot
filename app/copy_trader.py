@@ -138,8 +138,17 @@ def process_leader_trades():
             print(f"🎯 Outcome:     {outcome}")
             print(f"🆔 marketId:    {market_id}")
             print(f"🆔 condId:      {condition_id}")
-            print(f"💼 LUI:         {side} {size} @ {price}")
-            print(f"📝 TU (PAPER):  {side} {my_size:.4f} @ {price}")
+            # Colori + emoji BUY/SELL
+            if side.upper() == "BUY":
+            side_symbol = "🟢 BUY"
+            elif side.upper() == "SELL":
+            side_symbol = "🔴 SELL"
+            else:
+            side_symbol = side
+
+            print(f"💼 LUI:         {side_symbol} {size} @ {price}")
+            print(f"📝 TU (PAPER):  {side_symbol} {my_size:.4f} @ {price}")
+
             print(f"⏰ Quando:      {trade_date}")
             print("====================================")
 
