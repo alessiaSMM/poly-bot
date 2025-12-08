@@ -1,6 +1,5 @@
 import os
 import json
-import time
 import requests
 from app.market_mapper import MarketMapper
 
@@ -11,11 +10,11 @@ LEADERS = [
     "0x56687bf447db6ffa42ffe2204a05edaa20f55839",
 ]
 
-# Copia il 25% dell'operazione (solo PAPER MODE)
+# Percentuale di copia in PAPER MODE
 COPY_FACTOR = 0.25
 
 # File persistente per ricordare l’ultimo trade visto
-BASE_DIR = os.path.dirname(os.path.dirname(__file__))  # root del progetto
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 STATE_DIR = os.path.join(BASE_DIR, "state")
 os.makedirs(STATE_DIR, exist_ok=True)
 STATE_FILE = os.path.join(STATE_DIR, "leaders_state.json")
@@ -26,6 +25,7 @@ STATE_FILE = os.path.join(STATE_DIR, "leaders_state.json")
 # ---------------------------------------------------------------------
 
 def load_state():
+    """Carica ultimo timestamp visto per ogni leader."""
     if not os.path.exists(STATE_FILE):
         return {}
     try:
@@ -36,6 +36,7 @@ def load_state():
 
 
 def save_state(state):
+    """Salva ultimi timestamp per ogni leader."""
     try:
         with open(STATE_FILE, "w") as f:
             json.dump(state, f)
@@ -47,10 +48,11 @@ last_seen = load_state()
 
 
 # ---------------------------------------------------------------------
-# FUNZIONI API
+# API CALLS
 # ---------------------------------------------------------------------
 
 def fetch_trades(user):
+    """Ottiene ultimi trade del wallet dal Data API."""
     params = {"user": user, "limit": 50, "takerOnly": True}
     r = requests.get(DATA_API, params=params, timeout=10)
     r.raise_for_status()
@@ -58,7 +60,7 @@ def fetch_trades(user):
 
 
 # ---------------------------------------------------------------------
-# MARKET MAPPER (per arricchire i trade)
+# MARKET MAPPER
 # ---------------------------------------------------------------------
 
 market_mapper = MarketMapper()
@@ -70,6 +72,8 @@ market_mapper.refresh()
 # ---------------------------------------------------------------------
 
 def process_leader_trades():
+    """Processa nuovi trade delle balene seguite."""
+
     global last_seen
 
     if not LEADERS:
@@ -81,27 +85,29 @@ def process_leader_trades():
         if la not in last_seen:
             last_seen[la] = 0
 
+        # Ottieni trade
         try:
             trades = fetch_trades(leader)
         except Exception as e:
             print(f"❌ Errore fetch trades per {leader}: {e}")
             continue
 
-        # Data API → dal più recente al più vecchio
-        # Noi li processiamo dal più vecchio al più recente
         new_trades = 0
 
+        # Processa dal più vecchio al più nuovo
         for t in reversed(trades):
+
             ts = t.get("timestamp", 0)
 
-            # Se non è più recente, ignora
+            # Salta se non è nuovo
             if ts <= last_seen[la]:
                 continue
 
+            # Aggiorna ultimo timestamp visto
             last_seen[la] = ts
             new_trades += 1
 
-            # Parametri del trade
+            # Parametri principali
             side = t.get("side")
             size = float(t.get("size", 0))
             price = float(t.get("price", 0))
@@ -110,10 +116,10 @@ def process_leader_trades():
             market_id = t.get("marketId")
             condition_id = t.get("conditionId")
 
-            # PAPER copy-size
+            # PAPER MODE: copia della size
             my_size = size * COPY_FACTOR
 
-            # Arricchimento con Market Mapper
+            # Arricchimento tramite Market Mapper
             market = market_mapper.get_market_from_trade(t)
 
             category = market.get("category", "Unknown") if market else "Unknown"
@@ -126,8 +132,16 @@ def process_leader_trades():
 
             trade_date = MarketMapper.ts_to_italian(ts)
 
+            # BUY / SELL colorati
+            if side and side.upper() == "BUY":
+                side_symbol = "🟢 BUY"
+            elif side and side.upper() == "SELL":
+                side_symbol = "🔴 SELL"
+            else:
+                side_symbol = side
+
             # ------------------------------------------------------------
-            # LOG MOLTO PULITO
+            # LOG DETTAGLIATO
             # ------------------------------------------------------------
             print("====================================")
             print(f"👑 Leader:      {leader}")
@@ -138,19 +152,11 @@ def process_leader_trades():
             print(f"🎯 Outcome:     {outcome}")
             print(f"🆔 marketId:    {market_id}")
             print(f"🆔 condId:      {condition_id}")
-            # Colori + emoji BUY/SELL
-            if side.upper() == "BUY":
-            side_symbol = "🟢 BUY"
-            elif side.upper() == "SELL":
-            side_symbol = "🔴 SELL"
-            else:
-            side_symbol = side
-
             print(f"💼 LUI:         {side_symbol} {size} @ {price}")
             print(f"📝 TU (PAPER):  {side_symbol} {my_size:.4f} @ {price}")
-
             print(f"⏰ Quando:      {trade_date}")
             print("====================================")
 
+        # Salva stato se ci sono trade nuovi
         if new_trades > 0:
             save_state(last_seen)
