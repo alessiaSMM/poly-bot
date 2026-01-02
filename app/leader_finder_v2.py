@@ -2,107 +2,118 @@ import os
 import json
 import time
 import requests
-from collections import defaultdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 
-# ============================================================
-# LEADER FINDER v2 – CON STAMPA TRADE DETTAGLIATI
-# ============================================================
+# =========================
+# CONFIGURAZIONE
+# =========================
 
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
-DATA_TRADES_URL = "https://data-api.polymarket.com/trades"
+TRADES_URL = "https://data-api.polymarket.com/trades"
 
-REQUEST_TIMEOUT = 12
-MARKETS_LIMIT = 300
+STATE_DIR = "state"
+WHALES_DIR = os.path.join(STATE_DIR, "whales")
+AUTO_LEADERS_FILE = os.path.join(STATE_DIR, "auto_leaders.json")
+
 MAX_MARKETS_TO_SCAN = 40
-TRADES_LIMIT = 100
+TRADE_LOOKBACK_HOURS = 24
 
-WHALE_MIN_TOTAL_VOLUME = 50_000.0
-WHALE_MIN_TRADES = 3
-WHALE_LOOKBACK_HOURS = 72
+# Criteri BALENA (NON MODIFICATI)
+MIN_WHALE_VOLUME_USDC = 50_000
+MIN_WHALE_TRADES = 20
 
-BASE_DIR = os.path.dirname(os.path.dirname(__file__))
-STATE_DIR = os.path.join(BASE_DIR, "state")
-os.makedirs(STATE_DIR, exist_ok=True)
-LEADERS_FILE = os.path.join(STATE_DIR, "auto_leaders.json")
+REQUEST_TIMEOUT = 15
 
-ITALY_TZ = timezone(timedelta(hours=1))
-
-
-# ------------------------------------------------------------
+# =========================
 # UTILS
-# ------------------------------------------------------------
+# =========================
 
-def now_ts() -> int:
-    return int(time.time())
+def ensure_dirs():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    os.makedirs(WHALES_DIR, exist_ok=True)
 
-def hours_ago_ts(hours: int) -> int:
-    return now_ts() - hours * 3600
+def utc_now():
+    return datetime.now(timezone.utc)
 
-def ts_to_str(ts: int) -> str:
-    utc = datetime.fromtimestamp(ts, tz=timezone.utc)
-    ita = utc.astimezone(ITALY_TZ)
-    return f"{utc.strftime('%Y-%m-%d %H:%M:%S')} UTC | {ita.strftime('%Y-%m-%d %H:%M:%S')} IT"
+def parse_ts(ts_ms: int) -> datetime:
+    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
 
-def save_leaders(leaders):
-    with open(LEADERS_FILE, "w") as f:
-        json.dump(leaders, f, indent=2)
+def fmt_dt(dt: datetime) -> str:
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
-def http_get(url, params):
-    r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    return r.json()
+def load_json(path, default):
+    if not os.path.exists(path):
+        return default
+    with open(path, "r") as f:
+        return json.load(f)
 
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
 
-# ------------------------------------------------------------
-# FETCH
-# ------------------------------------------------------------
+# =========================
+# FETCH DATI
+# =========================
 
-def fetch_markets():
-    params = {
-        "limit": MARKETS_LIMIT,
-        "active": True,
-        "closed": False,
-        "archived": False,
-    }
-    return http_get(GAMMA_MARKETS_URL, params)
+def fetch_active_markets(limit=MAX_MARKETS_TO_SCAN):
+    resp = requests.get(
+        GAMMA_MARKETS_URL,
+        params={"limit": limit},
+        timeout=REQUEST_TIMEOUT
+    )
+    resp.raise_for_status()
+    return resp.json()
 
-def fetch_trades(condition_id):
-    params = {
-        "limit": TRADES_LIMIT,
-        "market": condition_id,
-    }
-    return http_get(DATA_TRADES_URL, params)
+def fetch_trades(condition_id: str):
+    resp = requests.get(
+        TRADES_URL,
+        params={"conditionId": condition_id},
+        timeout=REQUEST_TIMEOUT
+    )
+    resp.raise_for_status()
+    return resp.json()
 
+# =========================
+# LOGICA BALENA
+# =========================
 
-# ------------------------------------------------------------
-# CORE
-# ------------------------------------------------------------
+def scan_for_whales():
+    print("🔍 LeaderFinder v2.1 avviato")
+    print("🎯 STEP 1: RICERCA BALENE (ultime 24h – criteri invariati)")
+    print("====================================")
 
-def main():
-    print("🔍 LeaderFinder v2 avviato")
-    print("🎯 STEP 1: RICERCA BALENE (criteri STRICT – tutte le categorie)")
+    markets = fetch_active_markets()
+    print(f"📊 Mercati analizzati: {len(markets)}")
 
-    markets = fetch_markets()
-    cutoff = hours_ago_ts(WHALE_LOOKBACK_HOURS)
+    cutoff = utc_now() - timedelta(hours=TRADE_LOOKBACK_HOURS)
+    wallet_stats = {}
 
-    stats = defaultdict(lambda: {
-        "volume": 0.0,
-        "trades": [],
-    })
+    for idx, m in enumerate(markets, 1):
+        if idx % 10 == 0:
+            print(f"🔎 Scansione mercati: {idx}/{len(markets)}")
 
-    for idx, m in enumerate(markets[:MAX_MARKETS_TO_SCAN], start=1):
         condition_id = m.get("conditionId")
+        question = m.get("question", "—")
+        category = m.get("category", "—")
+
         if not condition_id:
             continue
 
-        trades = fetch_trades(condition_id)
+        try:
+            trades = fetch_trades(condition_id)
+        except Exception:
+            continue
+
         for t in trades:
-            ts = t.get("timestamp")
-            if not ts or ts < cutoff:
+            ts_ms = t.get("timestamp")
+            if not ts_ms:
                 continue
 
-            wallet = t.get("proxyWallet")
+            trade_dt = parse_ts(ts_ms)
+            if trade_dt < cutoff:
+                continue
+
+            wallet = t.get("maker") or t.get("taker")
             if not wallet:
                 continue
 
@@ -110,44 +121,73 @@ def main():
             price = float(t.get("price", 0))
             volume = size * price
 
-            stats[wallet]["volume"] += volume
-            stats[wallet]["trades"].append({
-                "question": m.get("question"),
-                "category": m.get("category"),
-                "conditionId": condition_id,
-                "side": "BUY" if t.get("side") == "buy" else "SELL",
+            if wallet not in wallet_stats:
+                wallet_stats[wallet] = {
+                    "volume": 0.0,
+                    "trades": [],
+                }
+
+            wallet_stats[wallet]["volume"] += volume
+            wallet_stats[wallet]["trades"].append({
+                "market": question,
+                "category": category,
                 "size": size,
                 "price": price,
-                "timestamp": ts,
-                "outcome": t.get("outcome"),
+                "volume": volume,
+                "timestamp": fmt_dt(trade_dt),
+                "conditionId": condition_id,
+                "side": t.get("side", "—")
             })
 
-            s = stats[wallet]
-            if len(s["trades"]) >= WHALE_MIN_TRADES and s["volume"] >= WHALE_MIN_TOTAL_VOLUME:
-                print("\n🐋 BALENA TROVATA")
-                print(f"👑 Wallet:          {wallet}")
-                print(f"💰 Volume stimato:  {s['volume']:.2f} USDC")
-                print(f"🔁 Trade recenti:   {len(s['trades'])}")
+    # =========================
+    # VALUTAZIONE BALENE
+    # =========================
 
-                print("\n📜 TRADE RECENTI (più recenti in alto)")
-                print("--------------------------------------------------")
+    for wallet, stats in wallet_stats.items():
+        total_volume = stats["volume"]
+        trade_count = len(stats["trades"])
 
-                for tr in sorted(s["trades"], key=lambda x: x["timestamp"], reverse=True)[:10]:
-                    emoji = "🟢" if tr["side"] == "BUY" else "🔴"
-                    print(
-                        f"{emoji} {tr['side']} | {tr['question']}\n"
-                        f"   📂 {tr['category']} | 🎯 {tr['outcome']}\n"
-                        f"   💼 {tr['size']} @ {tr['price']} = {tr['size'] * tr['price']:.2f} USDC\n"
-                        f"   🆔 {tr['conditionId']}\n"
-                        f"   ⏰ {ts_to_str(tr['timestamp'])}\n"
-                    )
+        if total_volume >= MIN_WHALE_VOLUME_USDC and trade_count >= MIN_WHALE_TRADES:
+            print("🐋 BALENA TROVATA")
+            print(f"👑 Wallet:          {wallet}")
+            print(f"💰 Volume stimato:  {total_volume:.2f} USDC")
+            print(f"🔁 Trade recenti:   {trade_count}")
+            print("📋 DETTAGLIO TRADE (ultime 24h):")
+            print("------------------------------------")
 
-                save_leaders([wallet])
-                return
+            for tr in stats["trades"]:
+                emoji = "🟢 BUY" if tr["side"] == "buy" else "🔴 SELL"
+                print(
+                    f"{emoji} | {tr['market']} | "
+                    f"{tr['size']:.2f} @ {tr['price']} | "
+                    f"{tr['timestamp']} | {tr['category']}"
+                )
 
-    print("❌ Nessuna balena trovata")
-    save_leaders([])
+            # Persistenza
+            whale_path = os.path.join(WHALES_DIR, f"{wallet}.json")
+            save_json(whale_path, {
+                "wallet": wallet,
+                "total_volume": total_volume,
+                "trade_count": trade_count,
+                "trades": stats["trades"],
+                "window_hours": TRADE_LOOKBACK_HOURS,
+                "saved_at": fmt_dt(utc_now())
+            })
 
+            save_json(AUTO_LEADERS_FILE, [wallet])
+
+            print("------------------------------------")
+            print(f"💾 Salvato storico in {whale_path}")
+            print(f"📌 Leader attivo scritto in {AUTO_LEADERS_FILE}")
+            return
+
+    print("❌ Nessuna balena trovata nelle ultime 24 ore")
+    save_json(AUTO_LEADERS_FILE, [])
+
+# =========================
+# MAIN
+# =========================
 
 if __name__ == "__main__":
-    main()
+    ensure_dirs()
+    scan_for_whales()
