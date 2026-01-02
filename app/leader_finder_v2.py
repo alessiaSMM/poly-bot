@@ -14,26 +14,27 @@ STATE_DIR = "state"
 WHALES_DIR = os.path.join(STATE_DIR, "whales")
 AUTO_LEADERS_FILE = os.path.join(STATE_DIR, "auto_leaders.json")
 
-MAX_MARKETS_TO_SCAN = 40
 LOOKBACK_HOURS = 24
 
-# STEP 1 – BALENE (STRICT)
+# STEP 1 – BALENE
 MIN_WHALE_VOLUME = 50_000
 MIN_WHALE_TRADES = 20
 
-# STEP 2 – TRADER ATTIVI QUALIFICATI (DOWNGRADE)
-MIN_TRADER_VOLUME = 1_000      # ⬅️ RIDOTTO
+# STEP 2 – TRADER QUALIFICATI
+MIN_TRADER_VOLUME = 1_000
 MIN_TRADER_TRADES = 5
 MIN_DISTINCT_MARKETS = 2
+
 ALLOWED_CATEGORIES_STEP2 = {
     "Politics",
-    "Geopolitics",
-    "Sport",
     "US-current-affairs",
-    "World"
+    "World",
+    "Geopolitics",
+    "Sport"
 }
 
 REQUEST_TIMEOUT = 15
+PAGE_LIMIT = 100   # limite massimo per Gamma
 
 # =========================
 # UTILS
@@ -57,17 +58,37 @@ def save_json(path, data):
         json.dump(data, f, indent=2)
 
 # =========================
-# FETCH
+# FETCH MARKETS (PAGINATO)
 # =========================
 
-def fetch_markets():
-    r = requests.get(
-        GAMMA_MARKETS_URL,
-        params={"limit": MAX_MARKETS_TO_SCAN},
-        timeout=REQUEST_TIMEOUT
-    )
-    r.raise_for_status()
-    return r.json()
+def fetch_all_active_markets():
+    print("📥 Caricamento di TUTTI i mercati attivi (paginato)")
+    markets = []
+    offset = 0
+
+    while True:
+        r = requests.get(
+            GAMMA_MARKETS_URL,
+            params={
+                "limit": PAGE_LIMIT,
+                "offset": offset,
+                "active": "true"
+            },
+            timeout=REQUEST_TIMEOUT
+        )
+        r.raise_for_status()
+        batch = r.json()
+
+        if not batch:
+            break
+
+        markets.extend(batch)
+        offset += PAGE_LIMIT
+
+        print(f"   → Mercati caricati: {len(markets)}")
+
+    print(f"✅ Totale mercati attivi: {len(markets)}")
+    return markets
 
 def fetch_trades(condition_id):
     r = requests.get(
@@ -79,22 +100,22 @@ def fetch_trades(condition_id):
     return r.json()
 
 # =========================
-# CORE LOGIC
+# CORE
 # =========================
 
 def leader_finder():
-    print("🔍 LeaderFinder v2.3 avviato")
-    print("🎯 STEP 1: RICERCA BALENE (24h, criteri STRICT)")
-    print("=" * 40)
+    print("🔍 LeaderFinder v2.4 avviato")
+    print("🎯 STEP 1: RICERCA BALENE (ultime 24h)")
+    print("=" * 50)
 
-    markets = fetch_markets()
+    markets = fetch_all_active_markets()
     cutoff = now_utc() - timedelta(hours=LOOKBACK_HOURS)
 
     stats = {}
 
-    for i, m in enumerate(markets, 1):
-        if i % 10 == 0:
-            print(f"🔎 Scansione mercati: {i}/{len(markets)}")
+    for idx, m in enumerate(markets, 1):
+        if idx % 50 == 0:
+            print(f"🔎 Analizzati mercati: {idx}/{len(markets)}")
 
         cid = m.get("conditionId")
         question = m.get("question", "—")
@@ -147,22 +168,17 @@ def leader_finder():
     # STEP 1 – BALENE
     # =========================
 
-    whales = []
-
-    for wallet, s in stats.items():
-        if s["volume"] >= MIN_WHALE_VOLUME and len(s["trades"]) >= MIN_WHALE_TRADES:
-            whales.append((wallet, s))
+    whales = [
+        (w, s) for w, s in stats.items()
+        if s["volume"] >= MIN_WHALE_VOLUME and len(s["trades"]) >= MIN_WHALE_TRADES
+    ]
 
     if whales:
         print("🐋 BALENE TROVATE")
         leaders = []
 
         for wallet, s in whales:
-            print(
-                f"👑 {wallet} | "
-                f"volume 24h {s['volume']:.2f} USDC | "
-                f"trade {len(s['trades'])}"
-            )
+            print(f"👑 {wallet} | volume {s['volume']:.2f} | trade {len(s['trades'])}")
             leaders.append(wallet)
 
             save_json(
@@ -185,8 +201,8 @@ def leader_finder():
     # =========================
 
     print("🚨 NESSUNA BALENA TROVATA")
-    print("🎯 STEP 2: TRADER ATTIVI QUALIFICATI (24h, volume ≥ 1.000 USDC)")
-    print("=" * 40)
+    print("🎯 STEP 2: TRADER ATTIVI QUALIFICATI (24h, ≥ 1.000 USDC)")
+    print("=" * 50)
 
     qualified = []
 
@@ -210,11 +226,7 @@ def leader_finder():
 
     leaders = []
     for wallet, s in qualified[:3]:
-        print(
-            f"👤 Trader: {wallet} | "
-            f"volume 24h {s['volume']:.2f} USDC | "
-            f"trade {len(s['trades'])}"
-        )
+        print(f"👤 Trader: {wallet} | volume {s['volume']:.2f} | trade {len(s['trades'])}")
         leaders.append(wallet)
 
     save_json(AUTO_LEADERS_FILE, leaders)
