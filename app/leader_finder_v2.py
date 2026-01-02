@@ -17,15 +17,21 @@ AUTO_LEADERS_FILE = os.path.join(STATE_DIR, "auto_leaders.json")
 MAX_MARKETS_TO_SCAN = 40
 LOOKBACK_HOURS = 24
 
-# STEP 1 – BALENE
+# STEP 1 – BALENE (STRICT)
 MIN_WHALE_VOLUME = 50_000
 MIN_WHALE_TRADES = 20
 
-# STEP 2 – TRADER QUALIFICATI
-MIN_TRADER_VOLUME = 5_000
+# STEP 2 – TRADER ATTIVI QUALIFICATI (DOWNGRADE)
+MIN_TRADER_VOLUME = 1_000      # ⬅️ RIDOTTO
 MIN_TRADER_TRADES = 5
 MIN_DISTINCT_MARKETS = 2
-ALLOWED_CATEGORIES_STEP2 = {"Politics", "Geopolitics", "Sport"}
+ALLOWED_CATEGORIES_STEP2 = {
+    "Politics",
+    "Geopolitics",
+    "Sport",
+    "US-current-affairs",
+    "World"
+}
 
 REQUEST_TIMEOUT = 15
 
@@ -55,12 +61,20 @@ def save_json(path, data):
 # =========================
 
 def fetch_markets():
-    r = requests.get(GAMMA_MARKETS_URL, params={"limit": MAX_MARKETS_TO_SCAN}, timeout=REQUEST_TIMEOUT)
+    r = requests.get(
+        GAMMA_MARKETS_URL,
+        params={"limit": MAX_MARKETS_TO_SCAN},
+        timeout=REQUEST_TIMEOUT
+    )
     r.raise_for_status()
     return r.json()
 
 def fetch_trades(condition_id):
-    r = requests.get(TRADES_URL, params={"conditionId": condition_id}, timeout=REQUEST_TIMEOUT)
+    r = requests.get(
+        TRADES_URL,
+        params={"conditionId": condition_id},
+        timeout=REQUEST_TIMEOUT
+    )
     r.raise_for_status()
     return r.json()
 
@@ -69,7 +83,7 @@ def fetch_trades(condition_id):
 # =========================
 
 def leader_finder():
-    print("🔍 LeaderFinder v2.2 avviato")
+    print("🔍 LeaderFinder v2.3 avviato")
     print("🎯 STEP 1: RICERCA BALENE (24h, criteri STRICT)")
     print("=" * 40)
 
@@ -142,8 +156,13 @@ def leader_finder():
     if whales:
         print("🐋 BALENE TROVATE")
         leaders = []
+
         for wallet, s in whales:
-            print(f"👑 {wallet} | volume {s['volume']:.2f} | trade {len(s['trades'])}")
+            print(
+                f"👑 {wallet} | "
+                f"volume 24h {s['volume']:.2f} USDC | "
+                f"trade {len(s['trades'])}"
+            )
             leaders.append(wallet)
 
             save_json(
@@ -166,7 +185,7 @@ def leader_finder():
     # =========================
 
     print("🚨 NESSUNA BALENA TROVATA")
-    print("⬇️ TARGET ABBASSATO: TRADER ATTIVI QUALIFICATI")
+    print("🎯 STEP 2: TRADER ATTIVI QUALIFICATI (24h, volume ≥ 1.000 USDC)")
     print("=" * 40)
 
     qualified = []
@@ -191,7 +210,11 @@ def leader_finder():
 
     leaders = []
     for wallet, s in qualified[:3]:
-        print(f"👤 Trader: {wallet} | volume {s['volume']:.2f} | trade {len(s['trades'])}")
+        print(
+            f"👤 Trader: {wallet} | "
+            f"volume 24h {s['volume']:.2f} USDC | "
+            f"trade {len(s['trades'])}"
+        )
         leaders.append(wallet)
 
     save_json(AUTO_LEADERS_FILE, leaders)
