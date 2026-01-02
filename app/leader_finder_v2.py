@@ -1,11 +1,10 @@
 import os
 import json
-import time
 import requests
 from datetime import datetime, timedelta, timezone
 
 # =========================
-# CONFIGURAZIONE
+# CONFIG
 # =========================
 
 GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
@@ -16,11 +15,17 @@ WHALES_DIR = os.path.join(STATE_DIR, "whales")
 AUTO_LEADERS_FILE = os.path.join(STATE_DIR, "auto_leaders.json")
 
 MAX_MARKETS_TO_SCAN = 40
-TRADE_LOOKBACK_HOURS = 24
+LOOKBACK_HOURS = 24
 
-# Criteri BALENA (NON MODIFICATI)
-MIN_WHALE_VOLUME_USDC = 50_000
+# STEP 1 – BALENE
+MIN_WHALE_VOLUME = 50_000
 MIN_WHALE_TRADES = 20
+
+# STEP 2 – TRADER QUALIFICATI
+MIN_TRADER_VOLUME = 5_000
+MIN_TRADER_TRADES = 5
+MIN_DISTINCT_MARKETS = 2
+ALLOWED_CATEGORIES_STEP2 = {"Politics", "Geopolitics", "Sport"}
 
 REQUEST_TIMEOUT = 15
 
@@ -32,85 +37,70 @@ def ensure_dirs():
     os.makedirs(STATE_DIR, exist_ok=True)
     os.makedirs(WHALES_DIR, exist_ok=True)
 
-def utc_now():
+def now_utc():
     return datetime.now(timezone.utc)
 
-def parse_ts(ts_ms: int) -> datetime:
-    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+def parse_ts(ms):
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
 
-def fmt_dt(dt: datetime) -> str:
+def fmt(dt):
     return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
-
-def load_json(path, default):
-    if not os.path.exists(path):
-        return default
-    with open(path, "r") as f:
-        return json.load(f)
 
 def save_json(path, data):
     with open(path, "w") as f:
         json.dump(data, f, indent=2)
 
 # =========================
-# FETCH DATI
+# FETCH
 # =========================
 
-def fetch_active_markets(limit=MAX_MARKETS_TO_SCAN):
-    resp = requests.get(
-        GAMMA_MARKETS_URL,
-        params={"limit": limit},
-        timeout=REQUEST_TIMEOUT
-    )
-    resp.raise_for_status()
-    return resp.json()
+def fetch_markets():
+    r = requests.get(GAMMA_MARKETS_URL, params={"limit": MAX_MARKETS_TO_SCAN}, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
 
-def fetch_trades(condition_id: str):
-    resp = requests.get(
-        TRADES_URL,
-        params={"conditionId": condition_id},
-        timeout=REQUEST_TIMEOUT
-    )
-    resp.raise_for_status()
-    return resp.json()
+def fetch_trades(condition_id):
+    r = requests.get(TRADES_URL, params={"conditionId": condition_id}, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
 
 # =========================
-# LOGICA BALENA
+# CORE LOGIC
 # =========================
 
-def scan_for_whales():
-    print("🔍 LeaderFinder v2.1 avviato")
-    print("🎯 STEP 1: RICERCA BALENE (ultime 24h – criteri invariati)")
-    print("====================================")
+def leader_finder():
+    print("🔍 LeaderFinder v2.2 avviato")
+    print("🎯 STEP 1: RICERCA BALENE (24h, criteri STRICT)")
+    print("=" * 40)
 
-    markets = fetch_active_markets()
-    print(f"📊 Mercati analizzati: {len(markets)}")
+    markets = fetch_markets()
+    cutoff = now_utc() - timedelta(hours=LOOKBACK_HOURS)
 
-    cutoff = utc_now() - timedelta(hours=TRADE_LOOKBACK_HOURS)
-    wallet_stats = {}
+    stats = {}
 
-    for idx, m in enumerate(markets, 1):
-        if idx % 10 == 0:
-            print(f"🔎 Scansione mercati: {idx}/{len(markets)}")
+    for i, m in enumerate(markets, 1):
+        if i % 10 == 0:
+            print(f"🔎 Scansione mercati: {i}/{len(markets)}")
 
-        condition_id = m.get("conditionId")
+        cid = m.get("conditionId")
         question = m.get("question", "—")
         category = m.get("category", "—")
 
-        if not condition_id:
+        if not cid:
             continue
 
         try:
-            trades = fetch_trades(condition_id)
+            trades = fetch_trades(cid)
         except Exception:
             continue
 
         for t in trades:
-            ts_ms = t.get("timestamp")
-            if not ts_ms:
+            ts = t.get("timestamp")
+            if not ts:
                 continue
 
-            trade_dt = parse_ts(ts_ms)
-            if trade_dt < cutoff:
+            dt = parse_ts(ts)
+            if dt < cutoff:
                 continue
 
             wallet = t.get("maker") or t.get("taker")
@@ -121,68 +111,91 @@ def scan_for_whales():
             price = float(t.get("price", 0))
             volume = size * price
 
-            if wallet not in wallet_stats:
-                wallet_stats[wallet] = {
-                    "volume": 0.0,
-                    "trades": [],
-                }
+            s = stats.setdefault(wallet, {
+                "volume": 0.0,
+                "trades": [],
+                "markets": set()
+            })
 
-            wallet_stats[wallet]["volume"] += volume
-            wallet_stats[wallet]["trades"].append({
+            s["volume"] += volume
+            s["markets"].add(question)
+            s["trades"].append({
                 "market": question,
                 "category": category,
+                "volume": volume,
                 "size": size,
                 "price": price,
-                "volume": volume,
-                "timestamp": fmt_dt(trade_dt),
-                "conditionId": condition_id,
-                "side": t.get("side", "—")
+                "side": t.get("side", "—"),
+                "timestamp": fmt(dt)
             })
 
     # =========================
-    # VALUTAZIONE BALENE
+    # STEP 1 – BALENE
     # =========================
 
-    for wallet, stats in wallet_stats.items():
-        total_volume = stats["volume"]
-        trade_count = len(stats["trades"])
+    whales = []
 
-        if total_volume >= MIN_WHALE_VOLUME_USDC and trade_count >= MIN_WHALE_TRADES:
-            print("🐋 BALENA TROVATA")
-            print(f"👑 Wallet:          {wallet}")
-            print(f"💰 Volume stimato:  {total_volume:.2f} USDC")
-            print(f"🔁 Trade recenti:   {trade_count}")
-            print("📋 DETTAGLIO TRADE (ultime 24h):")
-            print("------------------------------------")
+    for wallet, s in stats.items():
+        if s["volume"] >= MIN_WHALE_VOLUME and len(s["trades"]) >= MIN_WHALE_TRADES:
+            whales.append((wallet, s))
 
-            for tr in stats["trades"]:
-                emoji = "🟢 BUY" if tr["side"] == "buy" else "🔴 SELL"
-                print(
-                    f"{emoji} | {tr['market']} | "
-                    f"{tr['size']:.2f} @ {tr['price']} | "
-                    f"{tr['timestamp']} | {tr['category']}"
-                )
+    if whales:
+        print("🐋 BALENE TROVATE")
+        leaders = []
+        for wallet, s in whales:
+            print(f"👑 {wallet} | volume {s['volume']:.2f} | trade {len(s['trades'])}")
+            leaders.append(wallet)
 
-            # Persistenza
-            whale_path = os.path.join(WHALES_DIR, f"{wallet}.json")
-            save_json(whale_path, {
-                "wallet": wallet,
-                "total_volume": total_volume,
-                "trade_count": trade_count,
-                "trades": stats["trades"],
-                "window_hours": TRADE_LOOKBACK_HOURS,
-                "saved_at": fmt_dt(utc_now())
-            })
+            save_json(
+                os.path.join(WHALES_DIR, f"{wallet}.json"),
+                {
+                    "wallet": wallet,
+                    "type": "whale",
+                    "volume_24h": s["volume"],
+                    "trade_count": len(s["trades"]),
+                    "trades": s["trades"],
+                    "saved_at": fmt(now_utc())
+                }
+            )
 
-            save_json(AUTO_LEADERS_FILE, [wallet])
+        save_json(AUTO_LEADERS_FILE, leaders)
+        return
 
-            print("------------------------------------")
-            print(f"💾 Salvato storico in {whale_path}")
-            print(f"📌 Leader attivo scritto in {AUTO_LEADERS_FILE}")
-            return
+    # =========================
+    # STEP 2 – DOWNGRADE
+    # =========================
 
-    print("❌ Nessuna balena trovata nelle ultime 24 ore")
-    save_json(AUTO_LEADERS_FILE, [])
+    print("🚨 NESSUNA BALENA TROVATA")
+    print("⬇️ TARGET ABBASSATO: TRADER ATTIVI QUALIFICATI")
+    print("=" * 40)
+
+    qualified = []
+
+    for wallet, s in stats.items():
+        categories = {t["category"] for t in s["trades"]}
+
+        if (
+            s["volume"] >= MIN_TRADER_VOLUME and
+            len(s["trades"]) >= MIN_TRADER_TRADES and
+            len(s["markets"]) >= MIN_DISTINCT_MARKETS and
+            categories & ALLOWED_CATEGORIES_STEP2
+        ):
+            qualified.append((wallet, s))
+
+    qualified.sort(key=lambda x: x[1]["volume"], reverse=True)
+
+    if not qualified:
+        print("❌ Nessun trader qualificato trovato")
+        save_json(AUTO_LEADERS_FILE, [])
+        return
+
+    leaders = []
+    for wallet, s in qualified[:3]:
+        print(f"👤 Trader: {wallet} | volume {s['volume']:.2f} | trade {len(s['trades'])}")
+        leaders.append(wallet)
+
+    save_json(AUTO_LEADERS_FILE, leaders)
+    print("📌 Leader salvati in auto_leaders.json")
 
 # =========================
 # MAIN
@@ -190,4 +203,4 @@ def scan_for_whales():
 
 if __name__ == "__main__":
     ensure_dirs()
-    scan_for_whales()
+    leader_finder()
