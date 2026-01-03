@@ -1,108 +1,119 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
-LeaderFinder v5
-────────────────────────────────────────────────────────────
-OBIETTIVO:
-- Analizzare i trade GLOBALI delle ultime 24 ore
-- Identificare:
-  STEP 1 → BALENE (criteri STRICT)
-  STEP 2 → TRADER ATTIVI QUALIFICATI (criteri più permissivi)
-- Salvare:
-  - lista wallet leader (state/auto_leaders.json)
-  - report dettagliato (state/leaders_report.json)
+LeaderFinder v6
+================
 
-IMPORTANTE:
-- Nessun loop infinito
-- Nessuna copia trade
-- Solo ANALISI e SELEZIONE
-- Refresh previsto ogni 15 minuti via scheduler esterno
+OBIETTIVO
+---------
+Identificare balene o trader qualificati su Polymarket
+valutandoli su una finestra MOBILE di 24 ORE,
+con refresh periodico (15 minuti).
+
+IMPORTANTE
+----------
+- I TRADER vengono valutati su 24h rolling window
+- I TRADE nuovi (futuro copy) saranno solo quelli
+  successivi all’ultimo refresh
+- Questo script NON esegue trade
+- Questo script NON resta in ascolto (no loop infinito)
+
+È pensato per essere:
+- eseguito ogni 15 minuti (cron / scheduler)
+- idempotente
+- deterministico
 """
 
-import requests
 import json
 import os
+import time
+import requests
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
-# ────────────────────────────────────────────────────────────
-# CONFIG
-# ────────────────────────────────────────────────────────────
+# =========================
+# CONFIGURAZIONE
+# =========================
 
-CLOB_TRADES_URL = "https://data-api.polymarket.com/trades"
+TRADES_API = "https://data-api.polymarket.com/trades"
 STATE_DIR = "state"
-AUTO_LEADERS_FILE = os.path.join(STATE_DIR, "auto_leaders.json")
+TRADES_STATE_FILE = os.path.join(STATE_DIR, "trades_rolling_24h.json")
+LEADERS_FILE = os.path.join(STATE_DIR, "auto_leaders.json")
 REPORT_FILE = os.path.join(STATE_DIR, "leaders_report.json")
 
-BATCH_SIZE = 1000
-MAX_OFFSET = 100_000
+ROLLING_WINDOW_HOURS = 24
+REFRESH_MINUTES = 15
 
-LOOKBACK_HOURS = 24
-CUTOFF = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
+# CRITERI BALENE (STEP 1)
+WHALE_MIN_VOLUME = 50_000     # USDC su 24h
+WHALE_MIN_TRADES = 50
 
-# STEP 1 — BALENE (criteri STRICT)
-WHALE_MIN_VOLUME = 50_000      # USDC totali nelle 24h
-WHALE_MIN_TRADES = 200
-WHALE_MIN_MARKETS = 5
-
-# STEP 2 — TRADER QUALIFICATI
-QUAL_MIN_VOLUME = 1_000
+# CRITERI TRADER QUALIFICATI (STEP 2)
+QUAL_MIN_VOLUME = 1_000       # USDC su 24h
 QUAL_MIN_TRADES = 5
-QUAL_ALLOWED_KEYWORDS = [
-    "election", "president", "senate", "parliament",  # politica
-    "nba", "nfl", "nhl", "mlb", "soccer", "football",  # sport
-    "vs.", "win", "spread", "total"
-]
 
-# ────────────────────────────────────────────────────────────
-# UTILS
-# ────────────────────────────────────────────────────────────
+MAX_PAGES = 120               # limite difensivo API
+PAGE_SIZE = 1000
 
-def ensure_state_dir():
-    os.makedirs(STATE_DIR, exist_ok=True)
+os.makedirs(STATE_DIR, exist_ok=True)
 
-def parse_timestamp(ts):
+# =========================
+# UTILITY TIME
+# =========================
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+def parse_ts(ts):
     """
-    Parsing robusto timestamp (secondi / millisecondi / ISO)
+    Parsing robusto timestamp Polymarket.
     """
-    try:
-        if isinstance(ts, (int, float)):
-            if ts > 1e12:
-                return datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
-            return datetime.fromtimestamp(ts, tz=timezone.utc)
-        if isinstance(ts, str):
-            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except Exception:
-        return None
+    if isinstance(ts, (int, float)):
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+    if isinstance(ts, str):
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
     return None
 
-def fetch_trades():
+# =========================
+# LOAD / SAVE STATE
+# =========================
+
+def load_json(path, default):
+    if not os.path.exists(path):
+        return default
+    with open(path, "r") as f:
+        return json.load(f)
+
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+# =========================
+# FETCH TRADE RECENTI
+# =========================
+
+def fetch_recent_trades(cutoff):
     """
-    Fetch trade globali ordinati DESC per timestamp.
-    Stop quando si va oltre le 24h.
+    Scarica trade globali dal più recente all’indietro
+    finché non si scende sotto il cutoff (24h).
     """
-    all_trades = []
+    print("📡 Raccolta trade GLOBALI...")
+    trades = []
     offset = 0
 
-    print("📡 Raccolta trade GLOBALI (ultime 24h)...")
-
-    while offset < MAX_OFFSET:
+    for page in range(MAX_PAGES):
         params = {
-            "limit": BATCH_SIZE,
+            "limit": PAGE_SIZE,
             "offset": offset,
-            "sort": "timestamp",
             "order": "desc"
         }
-        r = requests.get(CLOB_TRADES_URL, params=params, timeout=30)
+        r = requests.get(TRADES_API, params=params, timeout=20)
         r.raise_for_status()
         batch = r.json()
 
         if not batch:
             break
 
-        first_ts = parse_timestamp(batch[0].get("timestamp"))
-        last_ts = parse_timestamp(batch[-1].get("timestamp"))
+        first_ts = parse_ts(batch[0]["timestamp"])
+        last_ts = parse_ts(batch[-1]["timestamp"])
 
         print(
             f"   Batch offset={offset} | "
@@ -110,177 +121,155 @@ def fetch_trades():
         )
 
         for t in batch:
-            ts = parse_timestamp(t.get("timestamp"))
-            if not ts:
-                continue
-            if ts < CUTOFF:
-                return all_trades
-            all_trades.append(t)
+            ts = parse_ts(t["timestamp"])
+            if ts and ts >= cutoff:
+                trades.append(t)
+            else:
+                return trades  # stop netto
 
-        offset += BATCH_SIZE
+        offset += PAGE_SIZE
+        time.sleep(0.1)
 
-    return all_trades
+    return trades
 
-# ────────────────────────────────────────────────────────────
+# =========================
 # MAIN LOGIC
-# ────────────────────────────────────────────────────────────
+# =========================
 
 def main():
-    ensure_state_dir()
+    print("🔍 LeaderFinder v6 avviato")
 
-    print("🔍 LeaderFinder v5 avviato")
-    print(f"🕒 Finestra analisi: ultime {LOOKBACK_HOURS} ore")
-    print("=" * 80)
+    now = now_utc()
+    cutoff = now - timedelta(hours=ROLLING_WINDOW_HOURS)
 
-    trades = fetch_trades()
-    print(f"✅ Trade raccolti entro 24h: {len(trades)}")
+    print(f"🕒 Rolling window: ultime {ROLLING_WINDOW_HOURS}h")
+    print(f"⏱️  Refresh previsto: ogni {REFRESH_MINUTES} min")
+    print(f"📌 Cutoff UTC: {cutoff}")
 
-    if not trades:
-        print("❌ Nessun trade rilevato")
-        json.dump([], open(AUTO_LEADERS_FILE, "w"), indent=2)
-        return
+    # -------------------------
+    # 1. Carica stato precedente
+    # -------------------------
+    rolling_trades = load_json(TRADES_STATE_FILE, [])
 
-    # Aggregazione per wallet
-    wallets = defaultdict(lambda: {
+    # Filtra solo quelli ancora validi
+    rolling_trades = [
+        t for t in rolling_trades
+        if parse_ts(t["timestamp"]) >= cutoff
+    ]
+
+    # -------------------------
+    # 2. Fetch nuovi trade
+    # -------------------------
+    new_trades = fetch_recent_trades(cutoff)
+
+    # Deduplica (tx_hash + log_index se presenti)
+    seen = {
+        (t.get("tx_hash"), t.get("log_index"))
+        for t in rolling_trades
+    }
+
+    fresh = []
+    for t in new_trades:
+        key = (t.get("tx_hash"), t.get("log_index"))
+        if key not in seen:
+            fresh.append(t)
+            seen.add(key)
+
+    print(f"➕ Trade nuovi aggiunti: {len(fresh)}")
+
+    rolling_trades.extend(fresh)
+
+    # Salva rolling window aggiornata
+    save_json(TRADES_STATE_FILE, rolling_trades)
+
+    print(f"📊 Trade totali in finestra 24h: {len(rolling_trades)}")
+
+    # -------------------------
+    # 3. Aggregazione per wallet
+    # -------------------------
+    stats = defaultdict(lambda: {
         "volume": 0.0,
         "trades": 0,
         "markets": set(),
-        "trade_samples": [],
-        "market_samples": {}
+        "recent": []
     })
 
-    for t in trades:
-        wallet = t.get("maker") or t.get("taker")
-        if not wallet:
-            continue
+    for t in rolling_trades:
+        wallet = t["maker"]
+        size = float(t.get("size", 0))
+        price = float(t.get("price", 0))
+        notional = size * price
 
-        amount = float(t.get("amount", 0))
-        wallets[wallet]["volume"] += amount
-        wallets[wallet]["trades"] += 1
+        stats[wallet]["volume"] += notional
+        stats[wallet]["trades"] += 1
+        stats[wallet]["markets"].add(t.get("condition_id"))
+        stats[wallet]["recent"].append(t)
 
-        cond_id = t.get("conditionId")
-        title = t.get("question")
-        slug = t.get("marketSlug")
-
-        if cond_id:
-            wallets[wallet]["markets"].add(cond_id)
-            if cond_id not in wallets[wallet]["market_samples"]:
-                wallets[wallet]["market_samples"][cond_id] = {
-                    "title": title,
-                    "slug": slug
-                }
-
-        if len(wallets[wallet]["trade_samples"]) < 25:
-            wallets[wallet]["trade_samples"].append({
-                "side": t.get("side"),
-                "amount": amount,
-                "price": t.get("price"),
-                "timestamp": t.get("timestamp"),
-                "question": title,
-                "outcome": t.get("outcome")
-            })
-
-    # ─────────────────────────────────────────────
-    # STEP 1 — BALENE
-    # ─────────────────────────────────────────────
-    print("\n🎯 STEP 1: BALENE (criteri STRICT)")
-    print("=" * 80)
-
+    # -------------------------
+    # 4. STEP 1 — BALENE
+    # -------------------------
     whales = []
-
-    for w, d in wallets.items():
+    for w, s in stats.items():
         if (
-            d["volume"] >= WHALE_MIN_VOLUME and
-            d["trades"] >= WHALE_MIN_TRADES and
-            len(d["markets"]) >= WHALE_MIN_MARKETS
+            s["volume"] >= WHALE_MIN_VOLUME
+            and s["trades"] >= WHALE_MIN_TRADES
         ):
-            whales.append((w, d))
+            whales.append((w, s))
 
-    whales.sort(key=lambda x: x[1]["volume"], reverse=True)
+    leaders = []
+    report = {}
 
     if whales:
         print(f"🐋 BALENE TROVATE: {len(whales)}")
+        for w, s in sorted(
+            whales, key=lambda x: x[1]["volume"], reverse=True
+        ):
+            print(
+                f"👑 {w} | volume 24h={s['volume']:.2f} | "
+                f"trade={s['trades']} | mercati={len(s['markets'])}"
+            )
+            leaders.append(w)
+            report[w] = s
     else:
-        print("🚨 NESSUNA BALENA TROVATA")
+        print("🚨 Nessuna balena trovata")
 
-    leaders = []
-    report = []
-
-    for wallet, d in whales:
-        leaders.append(wallet)
-        report.append({
-            "wallet": wallet,
-            "type": "whale",
-            "volume_24h": round(d["volume"], 2),
-            "trades_24h": d["trades"],
-            "markets_count": len(d["markets"]),
-            "markets": list(d["market_samples"].values())[:15],
-            "trades": d["trade_samples"]
-        })
-
-    # ─────────────────────────────────────────────
-    # STEP 2 — TRADER QUALIFICATI
-    # ─────────────────────────────────────────────
-    if not leaders:
-        print("\n⬇️⬇️⬇️ TARGET ABBASSATO ⬇️⬇️⬇️")
-        print("🎯 STEP 2: TRADER ATTIVI QUALIFICATI")
-        print("=" * 80)
+        # -------------------------
+        # 5. STEP 2 — QUALIFICATI
+        # -------------------------
+        print("⬇️ TARGET ABBASSATO: TRADER ATTIVI QUALIFICATI")
 
         qualified = []
+        for w, s in stats.items():
+            if (
+                s["volume"] >= QUAL_MIN_VOLUME
+                and s["trades"] >= QUAL_MIN_TRADES
+            ):
+                qualified.append((w, s))
 
-        for w, d in wallets.items():
-            if d["volume"] < QUAL_MIN_VOLUME or d["trades"] < QUAL_MIN_TRADES:
-                continue
-
-            text_blob = " ".join(
-                (v.get("title") or "").lower()
-                for v in d["market_samples"].values()
-            )
-
-            if any(k in text_blob for k in QUAL_ALLOWED_KEYWORDS):
-                qualified.append((w, d))
-
-        qualified.sort(key=lambda x: x[1]["volume"], reverse=True)
-
-        if qualified:
-            print(f"✅ TRADER QUALIFICATI: {len(qualified)}")
-        else:
+        if not qualified:
             print("❌ Nessun trader qualificato trovato")
+        else:
+            print(f"✅ Trader qualificati: {len(qualified)}")
+            for w, s in sorted(
+                qualified, key=lambda x: x[1]["volume"], reverse=True
+            ):
+                print(
+                    f"👤 {w} | volume 24h={s['volume']:.2f} | "
+                    f"trade={s['trades']} | mercati={len(s['markets'])}"
+                )
+                leaders.append(w)
+                report[w] = s
 
-        for wallet, d in qualified:
-            leaders.append(wallet)
-            report.append({
-                "wallet": wallet,
-                "type": "qualified",
-                "volume_24h": round(d["volume"], 2),
-                "trades_24h": d["trades"],
-                "markets_count": len(d["markets"]),
-                "markets": list(d["market_samples"].values())[:15],
-                "trades": d["trade_samples"]
-            })
+    # -------------------------
+    # 6. Output finale
+    # -------------------------
+    save_json(LEADERS_FILE, leaders)
+    save_json(REPORT_FILE, report)
 
-    # ─────────────────────────────────────────────
-    # OUTPUT
-    # ─────────────────────────────────────────────
-    json.dump(leaders, open(AUTO_LEADERS_FILE, "w"), indent=2)
-    json.dump(report, open(REPORT_FILE, "w"), indent=2)
-
-    print("\n📊 CLASSIFICA WALLET (TOP per volume 24h)")
-    print("=" * 80)
-    ranking = sorted(wallets.items(), key=lambda x: x[1]["volume"], reverse=True)[:10]
-    for i, (w, d) in enumerate(ranking, 1):
-        print(
-            f"{i:02d}. {w} | "
-            f"volume={d['volume']:.2f} | "
-            f"trades={d['trades']} | "
-            f"mercati={len(d['markets'])}"
-        )
-
-    print("\n📌 Salvato:", AUTO_LEADERS_FILE)
+    print("📌 Salvato:", LEADERS_FILE)
     print("📌 Report:", REPORT_FILE)
-    print("✅ LeaderFinder v5 completato")
+    print("✅ LeaderFinder v6 completato")
 
-# ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     main()
