@@ -1,103 +1,123 @@
-# app/leader_finder.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+leader_finder_v3.py
+
+Analisi batch dei trade Polymarket.
+- Legge state/trades_log.jsonl
+- Finestra mobile: ultime 24 ore
+- Identifica balene e trader attivi
+"""
 
 import json
+import time
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from pathlib import Path
 
-TRADES_LOG = "state/trades_log.jsonl"
-AUTO_LEADERS = "state/auto_leaders.json"
-REPORT = "state/leaders_report.json"
+STATE_FILE = Path("state/trades_log.jsonl")
+OUTPUT_LEADERS = Path("state/auto_leaders.json")
+OUTPUT_REPORT = Path("state/leaders_report.json")
 
-WINDOW_HOURS = 24
-WHALE_VOLUME = 50_000
-QUALIFIED_VOLUME = 1_000
+WINDOW_SECONDS = 24 * 60 * 60  # 24h
 
 
 def load_recent_trades():
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=WINDOW_HOURS)
-    trades = []
+    if not STATE_FILE.exists():
+        print("❌ Nessun file trade trovato")
+        return []
 
-    with open(TRADES_LOG, "r") as f:
+    now = time.time()
+    cutoff = now - WINDOW_SECONDS
+
+    recent_trades = []
+
+    with STATE_FILE.open("r", encoding="utf-8") as f:
         for line in f:
-            t = json.loads(line)
-            ts = datetime.fromtimestamp(t["ts"] / 1000, tz=timezone.utc)
+            try:
+                t = json.loads(line)
+            except Exception:
+                continue
+
+            ts_ms = t.get("timestamp")
+            if ts_ms is None:
+                continue
+
+            ts = ts_ms / 1000
             if ts >= cutoff:
-                trades.append(t)
+                recent_trades.append(t)
 
-    return trades
+    return recent_trades
 
 
-def aggregate(trades):
-    wallets = defaultdict(lambda: {
+def analyze_trades(trades):
+    stats = defaultdict(lambda: {
         "volume": 0.0,
-        "count": 0,
+        "trade_count": 0,
         "markets": set(),
-        "recent": []
     })
 
     for t in trades:
-        w = t["maker"]
-        notional = t["size"] * t["price"]
+        wallet = t.get("proxyWallet")
+        if not wallet:
+            continue
 
-        wallets[w]["volume"] += notional
-        wallets[w]["count"] += 1
-        wallets[w]["markets"].add(t["conditionId"])
+        size = t.get("size") or 0
+        price = t.get("price") or 0
+        condition = t.get("conditionId")
 
-        if len(wallets[w]["recent"]) < 10:
-            wallets[w]["recent"].append(t)
+        volume = float(size) * float(price)
 
-    return wallets
+        s = stats[wallet]
+        s["volume"] += volume
+        s["trade_count"] += 1
+        if condition:
+            s["markets"].add(condition)
 
+    # normalizza
+    results = []
+    for wallet, s in stats.items():
+        results.append({
+            "wallet": wallet,
+            "volume_24h": round(s["volume"], 2),
+            "trade_count": s["trade_count"],
+            "markets_count": len(s["markets"]),
+        })
 
-def classify(wallets):
-    whales = {}
-    qualified = {}
-
-    for w, d in wallets.items():
-        if d["volume"] >= WHALE_VOLUME:
-            whales[w] = d
-        elif d["volume"] >= QUALIFIED_VOLUME:
-            qualified[w] = d
-
-    return whales, qualified
+    # ordina per volume
+    results.sort(key=lambda x: x["volume_24h"], reverse=True)
+    return results
 
 
 def main():
     print("🔍 LeaderFinder avviato")
-    print(f"🕒 Finestra: ultime {WINDOW_HOURS} ore")
+    print("🕒 Finestra: ultime 24 ore")
 
     trades = load_recent_trades()
-    print(f"📊 Trade in finestra: {len(trades)}")
+    print(f"📊 Trade analizzati: {len(trades)}")
 
-    wallets = aggregate(trades)
-    whales, qualified = classify(wallets)
+    leaders = analyze_trades(trades)
 
-    print("\n🐋 BALENE")
-    for w, d in sorted(whales.items(), key=lambda x: -x[1]["volume"]):
-        print(f"  {w} | volume={d['volume']:.2f} | trade={d['count']} | mercati={len(d['markets'])}")
+    OUTPUT_LEADERS.parent.mkdir(parents=True, exist_ok=True)
 
-    if not whales:
-        print("  — nessuna balena trovata")
-
-    print("\n🎯 TRADER QUALIFICATI")
-    for w, d in sorted(qualified.items(), key=lambda x: -x[1]["volume"]):
-        print(f"  {w} | volume={d['volume']:.2f} | trade={d['count']}")
-
-    leaders = list(whales.keys()) if whales else list(qualified.keys())
-
-    with open(AUTO_LEADERS, "w") as f:
+    with OUTPUT_LEADERS.open("w", encoding="utf-8") as f:
         json.dump(leaders, f, indent=2)
 
-    with open(REPORT, "w") as f:
-        json.dump({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "window_hours": WINDOW_HOURS,
-            "whales": whales,
-            "qualified": qualified,
-        }, f, indent=2)
+    report = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "window_hours": 24,
+        "total_trades": len(trades),
+        "leaders_found": len(leaders),
+        "top_10": leaders[:10],
+    }
 
-    print("\n📌 Salvato:", AUTO_LEADERS)
-    print("📌 Report:", REPORT)
+    with OUTPUT_REPORT.open("w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+
+    print(f"✅ LeaderFinder completato — leader trovati: {len(leaders)}")
+    if leaders:
+        print(f"🥇 Top wallet: {leaders[0]['wallet']} (vol={leaders[0]['volume_24h']})")
 
 
 if __name__ == "__main__":
