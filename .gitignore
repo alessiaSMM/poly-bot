@@ -1,0 +1,9 @@
+# dati runtime
+state/
+*.jsonl
+
+# ambienti
+venv/
+__pycache__/
+*.pyc
+.env
