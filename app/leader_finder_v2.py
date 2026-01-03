@@ -1,8 +1,6 @@
-# app/leader_finder_v3.py
 import os
 import json
 import time
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -11,11 +9,11 @@ import requests
 # =========================
 # ENDPOINTS
 # =========================
-GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
+GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 DATA_TRADES_URL = "https://data-api.polymarket.com/trades"
 
 # =========================
-# OUTPUT / STATE
+# STATE / OUTPUT
 # =========================
 STATE_DIR = "state"
 AUTO_LEADERS_FILE = os.path.join(STATE_DIR, "auto_leaders.json")
@@ -27,47 +25,47 @@ LEADERS_REPORT_FILE = os.path.join(STATE_DIR, "leaders_report.json")
 LOOKBACK_HOURS = 24
 
 # =========================
-# STEP 1 (BALENE) – STRICT
+# STEP 1 – BALENE (STRICT)
 # =========================
 MIN_WHALE_VOLUME_USDC = 50_000.0
 MIN_WHALE_TRADES = 20
 MIN_WHALE_DISTINCT_MARKETS = 3
 
 # =========================
-# STEP 2 (QUALIFICATI) – FALLBACK
+# STEP 2 – QUALIFICATI (FALLBACK)
 # =========================
 MIN_TRADER_VOLUME_USDC = 1_000.0
 MIN_TRADER_TRADES = 5
 MIN_TRADER_DISTINCT_MARKETS = 2
 
-# categorie: Step 1 = tutte; Step 2 = sottoinsieme
 ALLOWED_CATEGORIES_STEP2 = {
+    # aggiustabili in futuro
     "Politics",
-    "US Current Affairs",
+    "US-current-affairs",
     "World",
     "Geopolitics",
     "Sports",
+    "Sport",
     "Tech",
 }
 
 # =========================
-# PERFORMANCE / PAGINATION
+# PERFORMANCE
 # =========================
 REQ_TIMEOUT = 20
 
-# Gamma pagination (limit+offset)
-EVENTS_PAGE_LIMIT = 200
-EVENTS_MAX_PAGES = 200  # safety
-
-# Data API /trades pagination (limit+offset) – offset max 10k (doc)
+# Data API trades pagination
 TRADES_LIMIT = 1000
-TRADES_MAX_OFFSET = 10_000
+TRADES_MAX_OFFSET = 10_000  # spesso limite pratico
 
-# Throttling leggero (rate limit /trades esiste)
-SLEEP_BETWEEN_TRADE_CALLS_SEC = 0.05
+# Throttle (gentile verso API)
+SLEEP_BETWEEN_HTTP_SEC = 0.03
+
+# Gamma lookups
+GAMMA_LOOKUP_SLEEP_SEC = 0.02
 
 # =========================
-# HELPERS
+# UTILS
 # =========================
 def ensure_state_dir() -> None:
     os.makedirs(STATE_DIR, exist_ok=True)
@@ -81,185 +79,15 @@ def ts_ms_to_dt_utc(ts_ms: int) -> datetime:
 def fmt_local(dt_utc: datetime) -> str:
     return dt_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
+def save_json(path: str, data) -> None:
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
 def safe_float(x, default: float = 0.0) -> float:
     try:
         return float(x)
     except Exception:
         return default
-
-def save_json(path: str, data) -> None:
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-
-# =========================
-# DATA MODELS
-# =========================
-@dataclass(frozen=True)
-class MarketMeta:
-    condition_id: str
-    question: str
-    slug: str
-    event_id: int
-    event_slug: str
-    category: str
-    end_date_iso: Optional[str]
-
-# =========================
-# GAMMA: eventi attivi -> mercati attivi
-# =========================
-def fetch_active_events_paginated() -> List[dict]:
-    """
-    Doc: usare active=true&closed=false per eventi live.
-    """
-    events: List[dict] = []
-    offset = 0
-
-    for page in range(1, EVENTS_MAX_PAGES + 1):
-        params = {
-            "active": "true",
-            "closed": "false",
-            "archived": "false",
-            "limit": EVENTS_PAGE_LIMIT,
-            "offset": offset,
-            "order": "id",
-            "ascending": "false",
-        }
-        r = requests.get(GAMMA_EVENTS_URL, params=params, timeout=REQ_TIMEOUT)
-        r.raise_for_status()
-        batch = r.json()
-        if not batch:
-            break
-
-        events.extend(batch)
-        offset += EVENTS_PAGE_LIMIT
-
-        # log leggero
-        if page % 2 == 0:
-            print(f"📥 Eventi attivi letti: {len(events)}")
-
-    return events
-
-def derive_category_from_event(event: dict) -> str:
-    """
-    Event.tags = array di tag {label, slug, id}. In assenza: '—'
-    """
-    tags = event.get("tags") or []
-    if not tags:
-        return "—"
-    # preferenza: label
-    label = tags[0].get("label") or tags[0].get("slug")
-    return label or "—"
-
-def build_active_market_cache(events: List[dict]) -> Tuple[Dict[str, MarketMeta], Dict[int, Set[str]]]:
-    """
-    Ritorna:
-    - condId -> MarketMeta
-    - eventId -> set(condId) (per sanity check)
-    """
-    cond_to_meta: Dict[str, MarketMeta] = {}
-    event_to_conditions: Dict[int, Set[str]] = {}
-
-    for ev in events:
-        ev_id_raw = ev.get("id")
-        if ev_id_raw is None:
-            continue
-        try:
-            ev_id = int(ev_id_raw)
-        except Exception:
-            continue
-
-        ev_slug = ev.get("slug") or "—"
-        category = derive_category_from_event(ev)
-        end_date = ev.get("endDate") or ev.get("endDateIso") or ev.get("end_date_iso")
-
-        markets = ev.get("markets") or []
-        for m in markets:
-            cid = m.get("conditionId") or m.get("condition_id") or m.get("conditionID")
-            if not cid:
-                continue
-
-            # filtri extra: evitare chiusi/archiviati se presenti
-            if m.get("closed") is True:
-                continue
-            if m.get("archived") is True:
-                continue
-
-            question = m.get("question") or m.get("title") or "—"
-            slug = m.get("slug") or m.get("market_slug") or "—"
-
-            cond_to_meta[cid] = MarketMeta(
-                condition_id=cid,
-                question=question,
-                slug=slug,
-                event_id=ev_id,
-                event_slug=ev_slug,
-                category=category,
-                end_date_iso=end_date,
-            )
-            event_to_conditions.setdefault(ev_id, set()).add(cid)
-
-    return cond_to_meta, event_to_conditions
-
-# =========================
-# DATA API: trades per eventId, stop a cutoff
-# =========================
-def fetch_trades_for_event_until_cutoff(event_id: int, cutoff_utc: datetime) -> List[dict]:
-    """
-    /trades supporta eventId + limit/offset.
-    Niente filtro time lato server: stop client-side quando timestamp < cutoff.
-    """
-    collected: List[dict] = []
-    offset = 0
-
-    while offset <= TRADES_MAX_OFFSET:
-        params = {
-            "eventId": str(event_id),
-            "limit": TRADES_LIMIT,
-            "offset": offset,
-            # default takerOnly=true da doc; lo lasciamo implicito (più "leader-like")
-        }
-        r = requests.get(DATA_TRADES_URL, params=params, timeout=REQ_TIMEOUT)
-        r.raise_for_status()
-        batch = r.json()
-
-        if not batch:
-            break
-
-        # trades ordinati per timestamp desc (doc)
-        stop_here = False
-        for t in batch:
-            ts = t.get("timestamp")
-            if ts is None:
-                continue
-            dt = ts_ms_to_dt_utc(int(ts))
-            if dt < cutoff_utc:
-                stop_here = True
-                break
-            collected.append(t)
-
-        if stop_here:
-            break
-
-        offset += TRADES_LIMIT
-        time.sleep(SLEEP_BETWEEN_TRADE_CALLS_SEC)
-
-    return collected
-
-# =========================
-# AGGREGATION
-# =========================
-def compute_usdc_volume(trade: dict) -> float:
-    # trade: size + price (doc)
-    size = safe_float(trade.get("size"))
-    price = safe_float(trade.get("price"))
-    return size * price
-
-def normalize_wallet(trade: dict) -> Optional[str]:
-    # Data API /trades ritorna proxyWallet
-    w = trade.get("proxyWallet") or trade.get("proxy_wallet") or trade.get("wallet")
-    if not w:
-        return None
-    return str(w).lower()
 
 def side_badge(side: str) -> str:
     s = (side or "").upper()
@@ -269,8 +97,148 @@ def side_badge(side: str) -> str:
         return "🔴 SELL"
     return "⚪️ ?"
 
-def pick_outcome(trade: dict) -> str:
-    # Data API /trades include outcome + outcomeIndex
+# =========================
+# 1) TRADES GLOBALI 24H
+# =========================
+def fetch_global_trades_24h(cutoff_utc: datetime) -> List[dict]:
+    """
+    Scarica trade globali paginando per offset.
+    Si ferma quando trova timestamp < cutoff (batch ordinati per timestamp decrescente nella pratica).
+    """
+    print("📡 Raccolta trade GLOBALI (stop quando < cutoff)...")
+    collected: List[dict] = []
+    offset = 0
+
+    while offset <= TRADES_MAX_OFFSET:
+        params = {"limit": TRADES_LIMIT, "offset": offset}
+        r = requests.get(DATA_TRADES_URL, params=params, timeout=REQ_TIMEOUT)
+        r.raise_for_status()
+        batch = r.json()
+
+        if not batch:
+            break
+
+        stop = False
+        for t in batch:
+            ts = t.get("timestamp")
+            if ts is None:
+                continue
+            dt = ts_ms_to_dt_utc(int(ts))
+            if dt < cutoff_utc:
+                stop = True
+                break
+            collected.append(t)
+
+        # progress
+        if offset % (TRADES_LIMIT * 2) == 0:
+            print(f"   → trade raccolti: {len(collected)} (offset={offset})")
+
+        if stop:
+            break
+
+        offset += TRADES_LIMIT
+        time.sleep(SLEEP_BETWEEN_HTTP_SEC)
+
+    print(f"✅ Trade entro 24h (grezzi): {len(collected)}")
+    return collected
+
+# =========================
+# 2) GAMMA: verifichiamo SOLO i conditionId visti nei trade
+# =========================
+def gamma_fetch_market_by_condition_id(condition_id: str) -> Optional[dict]:
+    """
+    Gamma non sempre documenta lo stesso parametro, quindi proviamo vari nomi.
+    Se torna una lista, prendiamo il primo.
+    """
+    candidates = [
+        {"conditionId": condition_id},
+        {"condition_id": condition_id},
+        {"conditionID": condition_id},
+        {"condition_ids": condition_id},  # qualche API usa questo pattern
+    ]
+
+    for params in candidates:
+        try:
+            r = requests.get(GAMMA_MARKETS_URL, params=params, timeout=REQ_TIMEOUT)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            if isinstance(data, list):
+                if not data:
+                    continue
+                return data[0]
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            continue
+
+    return None
+
+def is_market_still_active(market: dict) -> bool:
+    """
+    Interpreta i campi più comuni.
+    - closed True => non attivo
+    - archived True => non attivo
+    - active False => non attivo
+    Se un campo manca, non blocca da solo.
+    """
+    if market is None:
+        return False
+
+    if market.get("closed") is True:
+        return False
+    if market.get("archived") is True:
+        return False
+    if "active" in market and market.get("active") is False:
+        return False
+
+    return True
+
+def build_active_meta_for_condition_ids(condition_ids: Set[str]) -> Dict[str, dict]:
+    """
+    Per ogni conditionId visto nei trade, chiediamo a Gamma se il mercato è ancora attivo.
+    Cache solo su quello che serve: niente 30k mercati.
+    """
+    print(f"🧠 Verifica mercati su Gamma (conditionId unici da trade): {len(condition_ids)}")
+    active_meta: Dict[str, dict] = {}
+
+    checked = 0
+    for cid in condition_ids:
+        checked += 1
+        if checked % 200 == 0:
+            print(f"   → verificati: {checked}/{len(condition_ids)} | attivi: {len(active_meta)}")
+
+        m = gamma_fetch_market_by_condition_id(cid)
+        if m and is_market_still_active(m):
+            active_meta[cid] = m
+
+        time.sleep(GAMMA_LOOKUP_SLEEP_SEC)
+
+    print(f"✅ Mercati ancora attivi (intersezione): {len(active_meta)}")
+    return active_meta
+
+# =========================
+# 3) AGGREGAZIONE WALLET
+# =========================
+def normalize_wallet(trade: dict) -> Optional[str]:
+    # data-api spesso include proxyWallet; fallback su maker/taker se presente
+    w = trade.get("proxyWallet") or trade.get("proxy_wallet") or trade.get("wallet")
+    if w:
+        return str(w).lower()
+
+    # fallback: in alcune risposte ci sono maker/taker
+    w2 = trade.get("maker") or trade.get("taker")
+    if w2:
+        return str(w2).lower()
+
+    return None
+
+def compute_usdc_volume(trade: dict) -> float:
+    size = safe_float(trade.get("size"))
+    price = safe_float(trade.get("price"))
+    return size * price
+
+def trade_outcome(trade: dict) -> str:
     oc = trade.get("outcome")
     if oc:
         return str(oc)
@@ -279,34 +247,42 @@ def pick_outcome(trade: dict) -> str:
         return "—"
     return f"idx:{oi}"
 
-def build_wallet_stats(
-    trades: List[dict],
-    active_cond_to_meta: Dict[str, MarketMeta],
-) -> Dict[str, dict]:
-    """
-    Solo trade su mercati attivi: conditionId presente in active cache.
-    """
+def extract_category(market: dict) -> str:
+    return market.get("category") or "—"
+
+def extract_question(market: dict) -> str:
+    return market.get("question") or market.get("title") or "—"
+
+def extract_slug(market: dict) -> str:
+    return market.get("slug") or market.get("market_slug") or "—"
+
+def extract_end_date(market: dict) -> str:
+    return market.get("endDateIso") or market.get("end_date_iso") or market.get("endDate") or "—"
+
+def build_wallet_stats(trades_24h: List[dict], active_meta: Dict[str, dict]) -> Dict[str, dict]:
     wallets: Dict[str, dict] = {}
 
-    for t in trades:
+    for t in trades_24h:
         cid = t.get("conditionId")
         if not cid:
             continue
-        if cid not in active_cond_to_meta:
-            # vincolo richiesto: solo mercati ancora attivi
+
+        # vincolo richiesto: solo mercati ancora attivi
+        m = active_meta.get(cid)
+        if not m:
             continue
 
         wallet = normalize_wallet(t)
         if not wallet:
             continue
 
-        meta = active_cond_to_meta[cid]
         vol = compute_usdc_volume(t)
-
         ts = t.get("timestamp")
         if ts is None:
             continue
+
         dt = ts_ms_to_dt_utc(int(ts))
+        side = t.get("side", "—")
 
         entry = wallets.setdefault(
             wallet,
@@ -316,36 +292,35 @@ def build_wallet_stats(
                 "trade_count": 0,
                 "distinct_markets": set(),
                 "categories": set(),
-                "recent_trades": [],  # list of dict
+                "recent_trades": [],
             },
         )
 
         entry["volume_usdc"] += vol
         entry["trade_count"] += 1
         entry["distinct_markets"].add(cid)
-        entry["categories"].add(meta.category)
+        entry["categories"].add(extract_category(m))
 
         entry["recent_trades"].append(
             {
                 "timestamp_local": fmt_local(dt),
                 "timestamp_utc_ms": int(ts),
-                "side": t.get("side", "—"),
-                "badge": side_badge(t.get("side", "")),
+                "badge": side_badge(side),
+                "side": side,
                 "usdc_volume": round(vol, 6),
                 "size": safe_float(t.get("size")),
                 "price": safe_float(t.get("price")),
-                "outcome": pick_outcome(t),
+                "outcome": trade_outcome(t),
                 "conditionId": cid,
-                "question": meta.question,
-                "slug": meta.slug,
-                "eventSlug": meta.event_slug,
-                "category": meta.category,
-                "endDateIso": meta.end_date_iso or "—",
-                "tx": t.get("transactionHash") or "—",
+                "question": extract_question(m),
+                "slug": extract_slug(m),
+                "category": extract_category(m),
+                "endDateIso": extract_end_date(m),
+                "tx": t.get("transactionHash") or t.get("txHash") or "—",
             }
         )
 
-    # normalizza set -> list + sort trades desc
+    # normalizza
     for w in wallets.values():
         w["distinct_markets_count"] = len(w["distinct_markets"])
         w["distinct_markets"] = list(w["distinct_markets"])
@@ -355,22 +330,22 @@ def build_wallet_stats(
     return wallets
 
 # =========================
-# SELECTION
+# 4) SELEZIONE
 # =========================
 def select_whales(wallets: Dict[str, dict]) -> List[dict]:
-    whales = []
+    res = []
     for w in wallets.values():
         if (
             w["volume_usdc"] >= MIN_WHALE_VOLUME_USDC
             and w["trade_count"] >= MIN_WHALE_TRADES
             and w["distinct_markets_count"] >= MIN_WHALE_DISTINCT_MARKETS
         ):
-            whales.append(w)
-    whales.sort(key=lambda x: x["volume_usdc"], reverse=True)
-    return whales
+            res.append(w)
+    res.sort(key=lambda x: x["volume_usdc"], reverse=True)
+    return res
 
 def select_qualified(wallets: Dict[str, dict]) -> List[dict]:
-    qualified = []
+    res = []
     for w in wallets.values():
         if (
             w["volume_usdc"] >= MIN_TRADER_VOLUME_USDC
@@ -379,22 +354,21 @@ def select_qualified(wallets: Dict[str, dict]) -> List[dict]:
         ):
             cats = set(w["categories"])
             if cats & ALLOWED_CATEGORIES_STEP2:
-                qualified.append(w)
-    qualified.sort(key=lambda x: x["volume_usdc"], reverse=True)
-    return qualified
+                res.append(w)
+    res.sort(key=lambda x: x["volume_usdc"], reverse=True)
+    return res
 
 # =========================
-# PRINT
+# 5) STAMPA
 # =========================
 def print_leader_block(w: dict, max_trades: int = 25) -> None:
-    print("=" * 60)
-    print(f"👑 Wallet:         {w['wallet']}")
-    print(f"💰 Volume 24h:     {w['volume_usdc']:.2f} USDC")
-    print(f"🔁 Trade 24h:      {w['trade_count']}")
+    print("=" * 70)
+    print(f"👑 Wallet:           {w['wallet']}")
+    print(f"💰 Volume 24h:       {w['volume_usdc']:.2f} USDC")
+    print(f"🔁 Trade 24h:        {w['trade_count']}")
     print(f"🧾 Mercati distinti: {w['distinct_markets_count']}")
-    print(f"📂 Categorie:      {', '.join(w['categories']) if w['categories'] else '—'}")
+    print(f"📂 Categorie:        {', '.join(w['categories']) if w['categories'] else '—'}")
     print("🧾 Trade recenti (campione):")
-
     for tr in w["recent_trades"][:max_trades]:
         print(
             f"  {tr['badge']} | {tr['usdc_volume']:.2f} USDC | "
@@ -405,62 +379,59 @@ def print_leader_block(w: dict, max_trades: int = 25) -> None:
 # =========================
 # MAIN
 # =========================
-def main():
+def main() -> None:
     ensure_state_dir()
 
-    print("🔍 LeaderFinder v3 avviato")
     cutoff = utc_now() - timedelta(hours=LOOKBACK_HOURS)
+    print("🔍 LeaderFinder v4 avviato")
     print(f"🕒 Finestra: ultime {LOOKBACK_HOURS} ore (cutoff UTC: {cutoff.strftime('%Y-%m-%d %H:%M:%S')})")
     print("📌 Vincolo: solo trade 24h su mercati ANCORA attivi")
 
-    # 1) eventi attivi -> mercati attivi (cache)
-    print("📥 Caricamento eventi attivi da Gamma...")
-    events = fetch_active_events_paginated()
-    cond_to_meta, event_to_conditions = build_active_market_cache(events)
-    active_event_ids = sorted(list(event_to_conditions.keys()))
+    # 1) trades globali 24h
+    trades_24h = fetch_global_trades_24h(cutoff)
 
-    print(f"✅ Eventi attivi:  {len(active_event_ids)}")
-    print(f"✅ Mercati attivi: {len(cond_to_meta)}")
+    # se davvero 0, inutile proseguire
+    if not trades_24h:
+        print("❌ Nessun trade rilevato nelle ultime 24 ore (globale).")
+        save_json(AUTO_LEADERS_FILE, [])
+        save_json(LEADERS_REPORT_FILE, {
+            "generated_at_local": fmt_local(utc_now()),
+            "lookback_hours": LOOKBACK_HOURS,
+            "raw_trades_24h": 0,
+            "active_markets_checked": 0,
+            "unique_wallets": 0,
+            "whales": [],
+            "qualified": [],
+        })
+        return
 
-    # 2) trades recenti per eventId (stop a cutoff)
-    print("📡 Raccolta trade recenti per eventId (stop a cutoff)...")
-    recent_trades: List[dict] = []
-    scanned_events = 0
+    # 2) conditionId unici dai trade
+    condition_ids = {t.get("conditionId") for t in trades_24h if t.get("conditionId")}
+    condition_ids.discard(None)
 
-    for ev_id in active_event_ids:
-        scanned_events += 1
-        if scanned_events % 25 == 0:
-            print(f"   🔎 Eventi scansionati: {scanned_events}/{len(active_event_ids)} | trade raccolti: {len(recent_trades)}")
+    # 3) verifica su Gamma solo quei mercati
+    active_meta = build_active_meta_for_condition_ids(condition_ids)
 
-        try:
-            batch = fetch_trades_for_event_until_cutoff(ev_id, cutoff)
-        except Exception:
-            continue
-
-        if batch:
-            recent_trades.extend(batch)
-
-    print(f"✅ Trade grezzi entro 24h (pre-filtro mercati attivi): {len(recent_trades)}")
-
-    # 3) aggregazione per wallet, includendo SOLO conditionId attivi
-    wallets = build_wallet_stats(recent_trades, cond_to_meta)
+    # 4) aggregazione per wallet (solo trade su mercati attivi)
+    wallets = build_wallet_stats(trades_24h, active_meta)
     print(f"✅ Wallet unici (post-filtro mercati attivi): {len(wallets)}")
 
-    # 4) STEP 1 – balene
-    print("🎯 STEP 1: BALENE (criteri STRICT, tutte le categorie)")
-    whales = select_whales(wallets)
-
+    # report base
     report = {
         "generated_at_local": fmt_local(utc_now()),
         "lookback_hours": LOOKBACK_HOURS,
-        "active_events": len(active_event_ids),
-        "active_markets": len(cond_to_meta),
-        "raw_trades_24h": len(recent_trades),
+        "raw_trades_24h": len(trades_24h),
+        "condition_ids_seen": len(condition_ids),
+        "active_markets_checked": len(condition_ids),
+        "active_markets_matched": len(active_meta),
         "unique_wallets": len(wallets),
         "whales": [],
         "qualified": [],
     }
 
+    # STEP 1
+    print("🎯 STEP 1: BALENE (criteri STRICT, tutte le categorie)")
+    whales = select_whales(wallets)
     if whales:
         print(f"🐋 BALENE TROVATE: {len(whales)}")
         leaders = []
@@ -468,13 +439,14 @@ def main():
             print_leader_block(w, max_trades=25)
             leaders.append(w["wallet"])
             report["whales"].append(w)
+
         save_json(AUTO_LEADERS_FILE, leaders)
         save_json(LEADERS_REPORT_FILE, report)
         print(f"📌 Salvato: {AUTO_LEADERS_FILE}")
         print(f"📌 Report:  {LEADERS_REPORT_FILE}")
         return
 
-    # 5) STEP 2 – fallback
+    # STEP 2
     print("🚨 NESSUNA BALENA TROVATA")
     print("⬇️⬇️⬇️ TARGET ABBASSATO: TRADER ATTIVI QUALIFICATI ⬇️⬇️⬇️")
     print("🎯 STEP 2: QUALIFICATI (24h, volume ≥ 1.000 USDC, categorie selezionate)")
