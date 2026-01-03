@@ -2,7 +2,7 @@ import os
 import json
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import requests
 
@@ -10,7 +10,6 @@ import requests
 # ENDPOINTS
 # =========================
 DATA_TRADES_URL = "https://data-api.polymarket.com/trades"
-GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
 
 # =========================
 # STATE / OUTPUT
@@ -38,6 +37,8 @@ MIN_TRADER_VOLUME_USDC = 1_000.0
 MIN_TRADER_TRADES = 5
 MIN_TRADER_DISTINCT_MARKETS = 2
 
+# In v4.3: categorie disponibili SOLO se presenti nel trade payload.
+# Se mancano, non blocchiamo nulla.
 ALLOWED_CATEGORIES_STEP2 = {
     "Politics",
     "US-current-affairs",
@@ -52,10 +53,9 @@ ALLOWED_CATEGORIES_STEP2 = {
 # PERFORMANCE
 # =========================
 TRADES_LIMIT = 1000
-TRADES_MAX_OFFSET = 50_000  # aumentato: se serve, ma stoppiamo col cutoff
+TRADES_MAX_OFFSET = 80_000  # stop per cutoff comunque
 REQ_TIMEOUT = 25
-SLEEP_HTTP = 0.05
-SLEEP_GAMMA = 0.02
+SLEEP_HTTP = 0.03
 
 # =========================
 # UTILS
@@ -87,59 +87,72 @@ def side_badge(side: str) -> str:
         return "🔴 SELL"
     return "⚪️ ?"
 
-# =========================
-# TIME PARSING (FIX 1970)
-# =========================
 def parse_trade_datetime_utc(trade: dict) -> Optional[datetime]:
     """
-    Parsing robusto per timestamp Polymarket:
-    - timestamp in secondi o millisecondi
-    - createdAt / created_at ISO string
-    Ritorna datetime UTC.
+    Parsing robusto:
+    - timestamp (secondi o millisecondi)
+    - createdAt / created_at ISO
     """
-    # 1) timestamp numerico
     ts = trade.get("timestamp")
     if ts is not None and ts != "":
         try:
             ts_int = int(ts)
-            # < 10^10 => secondi (es. 1700000000)
             if ts_int < 10_000_000_000:
                 return datetime.fromtimestamp(ts_int, tz=timezone.utc)
-            # altrimenti millisecondi (es. 1700000000000)
             return datetime.fromtimestamp(ts_int / 1000, tz=timezone.utc)
         except Exception:
             pass
 
-    # 2) ISO strings
     for k in ("createdAt", "created_at"):
         v = trade.get(k)
         if v:
             try:
-                # es: "2026-01-03T12:34:56.789Z"
                 return datetime.fromisoformat(str(v).replace("Z", "+00:00")).astimezone(timezone.utc)
             except Exception:
                 continue
 
     return None
 
+def normalize_wallet(trade: dict) -> Optional[str]:
+    w = trade.get("proxyWallet") or trade.get("wallet") or trade.get("maker") or trade.get("taker")
+    if not w:
+        return None
+    return str(w).lower()
+
+def compute_usdc_volume(trade: dict) -> float:
+    # volume in USDC stimato: size * price
+    return safe_float(trade.get("size")) * safe_float(trade.get("price"))
+
+def trade_outcome(trade: dict) -> str:
+    if trade.get("outcome") is not None:
+        return str(trade.get("outcome"))
+    if trade.get("outcomeIndex") is not None:
+        return f"idx:{trade.get('outcomeIndex')}"
+    return "—"
+
+def trade_market_label(trade: dict) -> str:
+    # Non sempre il trade contiene question/slug: fallback su conditionId.
+    return (
+        trade.get("question")
+        or trade.get("title")
+        or trade.get("market_question")
+        or trade.get("marketTitle")
+        or "—"
+    )
+
+def trade_category(trade: dict) -> str:
+    return trade.get("category") or trade.get("marketCategory") or "—"
+
+def trade_slug(trade: dict) -> str:
+    return trade.get("slug") or trade.get("market_slug") or trade.get("marketSlug") or "—"
+
 # =========================
-# 1) TRADES GLOBALI ULTIME 24H
+# 1) FETCH TRADES GLOBALI 24H
 # =========================
 def fetch_trades_global_24h(cutoff_utc: datetime) -> List[dict]:
-    """
-    Scarica trade globali e mantiene solo quelli >= cutoff.
-    Importante: NON assumiamo unità del timestamp.
-    Inoltre NON ci fidiamo ciecamente dell'ordinamento:
-    - proviamo sort/order
-    - se non funziona, continuiamo comunque finché troviamo trade >= cutoff,
-      con una safety: max offset.
-    """
-    print("📡 Raccolta trade GLOBALI (con parsing timestamp robusto)...")
-
+    print("📡 Raccolta trade GLOBALI (v4.3: niente Gamma, attivo = trade recente)")
     collected: List[dict] = []
     offset = 0
-
-    # proviamo ordering; se non cambia nulla, non ci rompe
     use_sort = True
 
     while offset <= TRADES_MAX_OFFSET:
@@ -156,48 +169,33 @@ def fetch_trades_global_24h(cutoff_utc: datetime) -> List[dict]:
         if not batch:
             break
 
-        # diagnostica: primi/ultimi tempi batch (con parsing robusto)
         dt_first = parse_trade_datetime_utc(batch[0])
         dt_last = parse_trade_datetime_utc(batch[-1])
 
         if dt_first and dt_last:
-            print(
-                f"   Batch offset={offset} | "
-                f"first={fmt_local(dt_first)} | last={fmt_local(dt_last)}"
-            )
+            print(f"   Batch offset={offset} | first={fmt_local(dt_first)} | last={fmt_local(dt_last)}")
         else:
-            print(f"   Batch offset={offset} | (timestamp non parseabile su first/last)")
+            print(f"   Batch offset={offset} | first/last non parseabili")
 
         # raccogliamo solo >= cutoff
-        any_recent_in_batch = False
         for t in batch:
             dt = parse_trade_datetime_utc(t)
             if not dt:
                 continue
             if dt >= cutoff_utc:
                 collected.append(t)
-                any_recent_in_batch = True
 
-        # Se ordering è attivo e l'ultimo è già sotto cutoff, possiamo stopparci
+        # stop rapido se sort funziona
         if use_sort and dt_last and dt_last < cutoff_utc:
             break
 
-        # Se ordering è attivo ma vediamo che dt_first è già troppo vecchio,
-        # vuol dire che sort/order non sta funzionando: disabilitiamo e riproviamo da capo.
+        # se sort non funziona (first già vecchio), disattiva e riparti
         if offset == 0 and use_sort and dt_first and dt_first < cutoff_utc:
-            print("⚠️ sort/order sembra ignorato: retry senza sort/order")
+            print("⚠️ sort/order ignorato: retry senza sort")
             use_sort = False
             collected.clear()
             offset = 0
             continue
-
-        # Se non stiamo usando sort e non troviamo nulla di recente in questo batch,
-        # non possiamo sapere se i prossimi offset contengono trade più recenti.
-        # Però per evitare loop infinito, usiamo una regola pratica:
-        # se già ai primi offset non compare nulla di recente, stoppiamo presto.
-        if not use_sort and offset >= (TRADES_LIMIT * 3) and len(collected) == 0 and not any_recent_in_batch:
-            print("⚠️ Nessun trade recente trovato nei primi batch senza ordering: stop di sicurezza")
-            break
 
         offset += TRADES_LIMIT
         time.sleep(SLEEP_HTTP)
@@ -206,94 +204,9 @@ def fetch_trades_global_24h(cutoff_utc: datetime) -> List[dict]:
     return collected
 
 # =========================
-# 2) GAMMA: lookup mercati per conditionId (solo quelli visti nei trade)
+# 2) AGGREGAZIONE WALLET (solo trade entro cutoff)
 # =========================
-def gamma_market_by_condition_id(cid: str) -> Optional[dict]:
-    """
-    Gamma /markets spesso supporta filtro conditionId.
-    Se torna lista, prendiamo il primo.
-    """
-    # Tentativi multipli (alcune varianti di parametro)
-    params_list = [
-        {"conditionId": cid},
-        {"condition_id": cid},
-        {"conditionID": cid},
-    ]
-    for params in params_list:
-        try:
-            r = requests.get(GAMMA_MARKETS_URL, params=params, timeout=REQ_TIMEOUT)
-            if r.status_code != 200:
-                continue
-            data = r.json()
-            if isinstance(data, list):
-                if data:
-                    return data[0]
-            elif isinstance(data, dict):
-                return data
-        except Exception:
-            continue
-    return None
-
-def market_is_active(m: dict) -> bool:
-    if not m:
-        return False
-    if m.get("closed") is True:
-        return False
-    if m.get("archived") is True:
-        return False
-    if "active" in m and m.get("active") is False:
-        return False
-    return True
-
-def build_active_meta(condition_ids: Set[str]) -> Dict[str, dict]:
-    print(f"🧠 Verifica mercati su Gamma per conditionId unici: {len(condition_ids)}")
-    active: Dict[str, dict] = {}
-
-    for i, cid in enumerate(condition_ids, 1):
-        m = gamma_market_by_condition_id(cid)
-        if m and market_is_active(m):
-            active[cid] = m
-
-        if i % 150 == 0:
-            print(f"   → Gamma check {i}/{len(condition_ids)} | attivi={len(active)}")
-
-        time.sleep(SLEEP_GAMMA)
-
-    print(f"✅ Mercati ancora attivi (intersezione): {len(active)}")
-    return active
-
-# =========================
-# 3) AGGREGATION WALLET
-# =========================
-def normalize_wallet(trade: dict) -> Optional[str]:
-    w = trade.get("proxyWallet") or trade.get("wallet") or trade.get("maker") or trade.get("taker")
-    if not w:
-        return None
-    return str(w).lower()
-
-def compute_usdc_volume(trade: dict) -> float:
-    return safe_float(trade.get("size")) * safe_float(trade.get("price"))
-
-def trade_outcome(trade: dict) -> str:
-    if trade.get("outcome") is not None:
-        return str(trade.get("outcome"))
-    if trade.get("outcomeIndex") is not None:
-        return f"idx:{trade.get('outcomeIndex')}"
-    return "—"
-
-def get_category(market: dict) -> str:
-    return market.get("category") or "—"
-
-def get_question(market: dict) -> str:
-    return market.get("question") or market.get("title") or "—"
-
-def get_slug(market: dict) -> str:
-    return market.get("slug") or market.get("market_slug") or "—"
-
-def get_end_date(market: dict) -> str:
-    return market.get("endDateIso") or market.get("end_date_iso") or market.get("endDate") or "—"
-
-def aggregate_wallets(trades_24h: List[dict], active_meta: Dict[str, dict]) -> Dict[str, dict]:
+def aggregate_wallets(trades_24h: List[dict]) -> Dict[str, dict]:
     wallets: Dict[str, dict] = {}
 
     for t in trades_24h:
@@ -301,39 +214,45 @@ def aggregate_wallets(trades_24h: List[dict], active_meta: Dict[str, dict]) -> D
         if not cid:
             continue
 
-        # vincolo richiesto: solo mercati ancora attivi
-        m = active_meta.get(cid)
-        if not m:
-            continue
-
-        w = normalize_wallet(t)
-        if not w:
-            continue
-
         dt = parse_trade_datetime_utc(t)
         if not dt:
+            continue
+
+        wallet = normalize_wallet(t)
+        if not wallet:
             continue
 
         vol = compute_usdc_volume(t)
         side = t.get("side", "—")
 
-        e = wallets.setdefault(w, {
-            "wallet": w,
+        e = wallets.setdefault(wallet, {
+            "wallet": wallet,
             "volume_usdc": 0.0,
             "trade_count": 0,
             "distinct_markets": set(),
             "categories": set(),
-            "recent_trades": []
+            "recent_trades": [],
+            "example_markets": {},  # cid -> {label, slug, category}
         })
 
         e["volume_usdc"] += vol
         e["trade_count"] += 1
         e["distinct_markets"].add(cid)
-        e["categories"].add(get_category(m))
+
+        cat = trade_category(t)
+        if cat and cat != "—":
+            e["categories"].add(cat)
+
+        # conserviamo un esempio market info per quel conditionId
+        if cid not in e["example_markets"]:
+            e["example_markets"][cid] = {
+                "question": trade_market_label(t),
+                "slug": trade_slug(t),
+                "category": cat,
+            }
 
         e["recent_trades"].append({
             "timestamp_local": fmt_local(dt),
-            "timestamp_utc": dt.strftime("%Y-%m-%d %H:%M:%S"),
             "badge": side_badge(side),
             "side": side,
             "usdc_volume": round(vol, 6),
@@ -341,24 +260,35 @@ def aggregate_wallets(trades_24h: List[dict], active_meta: Dict[str, dict]) -> D
             "price": safe_float(t.get("price")),
             "outcome": trade_outcome(t),
             "conditionId": cid,
-            "question": get_question(m),
-            "slug": get_slug(m),
-            "category": get_category(m),
-            "endDateIso": get_end_date(m),
+            "question": trade_market_label(t),
+            "slug": trade_slug(t),
+            "category": cat,
             "tx": t.get("transactionHash") or t.get("txHash") or "—",
         })
 
-    # normalizza
-    for e in wallets.values():
-        e["distinct_markets_count"] = len(e["distinct_markets"])
-        e["distinct_markets"] = list(e["distinct_markets"])
-        e["categories"] = sorted(list(e["categories"]))
-        e["recent_trades"].sort(key=lambda x: x["timestamp_local"], reverse=True)
+    for w in wallets.values():
+        w["distinct_markets_count"] = len(w["distinct_markets"])
+        w["distinct_markets"] = list(w["distinct_markets"])
+        w["categories"] = sorted(list(w["categories"]))
+        w["recent_trades"].sort(key=lambda x: x["timestamp_local"], reverse=True)
+
+        # example markets list
+        w["example_markets_list"] = []
+        for cid, info in w["example_markets"].items():
+            w["example_markets_list"].append({
+                "conditionId": cid,
+                "question": info.get("question", "—"),
+                "slug": info.get("slug", "—"),
+                "category": info.get("category", "—"),
+            })
+
+        # pulizia
+        del w["example_markets"]
 
     return wallets
 
 # =========================
-# 4) SELEZIONE
+# 3) SELEZIONE
 # =========================
 def select_whales(wallets: Dict[str, dict]) -> List[dict]:
     whales = []
@@ -380,22 +310,36 @@ def select_qualified(wallets: Dict[str, dict]) -> List[dict]:
             and w["trade_count"] >= MIN_TRADER_TRADES
             and w["distinct_markets_count"] >= MIN_TRADER_DISTINCT_MARKETS
         ):
+            # Se abbiamo categorie, applichiamo filtro; se non le abbiamo, NON blocchiamo.
             cats = set(w["categories"])
-            if cats & ALLOWED_CATEGORIES_STEP2:
+            if not cats:
                 qualified.append(w)
+            else:
+                if cats & ALLOWED_CATEGORIES_STEP2:
+                    qualified.append(w)
+
     qualified.sort(key=lambda x: x["volume_usdc"], reverse=True)
     return qualified
 
 # =========================
-# 5) PRINT
+# 4) STAMPA
 # =========================
-def print_leader(w: dict, max_trades: int = 25) -> None:
-    print("=" * 70)
+def print_leader(w: dict, max_trades: int = 20, max_markets: int = 10) -> None:
+    print("=" * 80)
     print(f"👑 Wallet:           {w['wallet']}")
     print(f"💰 Volume 24h:       {w['volume_usdc']:.2f} USDC")
     print(f"🔁 Trade 24h:        {w['trade_count']}")
     print(f"🧾 Mercati distinti: {w['distinct_markets_count']}")
-    print(f"📂 Categorie:        {', '.join(w['categories']) if w['categories'] else '—'}")
+
+    if w["categories"]:
+        print(f"📂 Categorie (dal trade payload): {', '.join(w['categories'])}")
+    else:
+        print("📂 Categorie:        — (non presenti nel payload trade)")
+
+    print("🧾 Mercati (campione):")
+    for m in w["example_markets_list"][:max_markets]:
+        print(f"  - {m['category']} | {m['question']} | slug={m['slug']} | condId={m['conditionId']}")
+
     print("🧾 Trade recenti (campione):")
     for tr in w["recent_trades"][:max_trades]:
         print(
@@ -409,22 +353,20 @@ def print_leader(w: dict, max_trades: int = 25) -> None:
 # =========================
 def main():
     ensure_state_dir()
-
     cutoff = utc_now() - timedelta(hours=LOOKBACK_HOURS)
-    print("🔍 LeaderFinder v4.2 avviato")
+
+    print("🔍 LeaderFinder v4.3 avviato")
     print(f"🕒 Cutoff UTC: {cutoff.strftime('%Y-%m-%d %H:%M:%S')}")
-    print("📌 Vincolo: solo trade 24h su mercati ANCORA attivi")
+    print("📌 Definizione: mercato 'attivo' = ha trade nelle ultime 24 ore (CLOB reality)")
 
     trades_24h = fetch_trades_global_24h(cutoff)
     if not trades_24h:
-        print("❌ Nessun trade recente rilevato (ora davvero strano).")
+        print("❌ Nessun trade recente rilevato (questa volta sarebbe davvero anomalo).")
         save_json(AUTO_LEADERS_FILE, [])
         save_json(LEADERS_REPORT_FILE, {
             "generated_at_local": fmt_local(utc_now()),
             "lookback_hours": LOOKBACK_HOURS,
             "raw_trades_24h": 0,
-            "condition_ids_seen": 0,
-            "active_markets_matched": 0,
             "unique_wallets": 0,
             "whales": [],
             "qualified": [],
@@ -433,19 +375,16 @@ def main():
 
     condition_ids = {t.get("conditionId") for t in trades_24h if t.get("conditionId")}
     condition_ids.discard(None)
-    print(f"🔎 conditionId unici dai trade recenti: {len(condition_ids)}")
+    print(f"🔎 conditionId unici nei trade 24h: {len(condition_ids)}")
 
-    active_meta = build_active_meta(condition_ids)
-
-    wallets = aggregate_wallets(trades_24h, active_meta)
-    print(f"👛 Wallet unici (post-filtro attivi): {len(wallets)}")
+    wallets = aggregate_wallets(trades_24h)
+    print(f"👛 Wallet unici (trade 24h): {len(wallets)}")
 
     report = {
         "generated_at_local": fmt_local(utc_now()),
         "lookback_hours": LOOKBACK_HOURS,
         "raw_trades_24h": len(trades_24h),
         "condition_ids_seen": len(condition_ids),
-        "active_markets_matched": len(active_meta),
         "unique_wallets": len(wallets),
         "whales": [],
         "qualified": [],
@@ -458,7 +397,7 @@ def main():
         print(f"🐋 BALENE TROVATE: {len(whales)}")
         leaders = []
         for w in whales[:10]:
-            print_leader(w, max_trades=25)
+            print_leader(w, max_trades=25, max_markets=15)
             leaders.append(w["wallet"])
             report["whales"].append(w)
 
@@ -471,7 +410,7 @@ def main():
     # STEP 2
     print("🚨 NESSUNA BALENA TROVATA")
     print("⬇️⬇️⬇️ TARGET ABBASSATO: TRADER ATTIVI QUALIFICATI ⬇️⬇️⬇️")
-    print("🎯 STEP 2: QUALIFICATI (24h, volume ≥ 1.000 USDC, categorie selezionate)")
+    print("🎯 STEP 2: QUALIFICATI (24h, volume ≥ 1.000 USDC, categorie preferite se disponibili)")
 
     qualified = select_qualified(wallets)
     if not qualified:
@@ -485,7 +424,7 @@ def main():
     print(f"✅ Trader qualificati trovati: {len(qualified)}")
     leaders = []
     for w in qualified[:10]:
-        print_leader(w, max_trades=20)
+        print_leader(w, max_trades=20, max_markets=10)
         leaders.append(w["wallet"])
         report["qualified"].append(w)
 
